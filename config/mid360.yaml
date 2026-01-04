@@ -1,0 +1,88 @@
+# Configuration for Livox Mid-360 LiDAR
+# Used with the non-ROS SLAM stack
+
+# Common settings
+common:
+  # Hardware
+  lidar_ip: "192.168.1.112"
+  host_ip: "192.168.1.50"
+  cmd_data_port: 56100
+  push_msg_port: 56200
+  point_data_port: 56300
+  imu_data_port: 56400
+  log_data_port: 56500
+
+# Preprocessing settings
+preprocess:
+  lidar_type: 1                # 1 = Livox Mid-360
+  scan_lines: 4                # Mid-360 has 4 scan lines
+  blind_distance: 0.5          # Minimum distance (meters)
+  max_distance: 100.0          # Maximum distance (meters)
+  point_filter_num: 1          # Keep every Nth point (1 = all)
+  feature_extraction: false    # Disable feature extraction for dense clouds
+
+# IMU settings
+imu:
+  # Noise parameters (Mid-360 internal IMU)
+  acc_noise: 0.1
+  gyro_noise: 0.1
+  acc_bias_noise: 0.0001
+  gyro_bias_noise: 0.0001
+
+  # IMU rate
+  rate_hz: 200
+
+# SLAM settings
+slam:
+  # Optimization
+  max_iterations: 4
+  convergence_threshold: 0.001
+
+  # Map parameters
+  map_resolution: 0.1          # Voxel size for map (meters)
+  max_points_per_voxel: 20
+  local_map_radius: 50.0       # Local map radius (meters)
+
+  # Motion undistortion
+  deskew_enabled: true
+
+  # Gravity alignment at startup
+  gravity_align: true
+
+# Extrinsic calibration (LiDAR to IMU)
+# Mid-360 has internal IMU, so these are typically near identity
+extrinsic:
+  translation: [-0.011, -0.0234, 0.044]  # meters
+  rotation:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  estimate_online: false
+
+# Output settings
+output:
+  # Point cloud output
+  publish_current_scan: true
+  publish_map: true
+  publish_deskewed: true
+
+  # Map saving
+  save_map: true
+  map_save_interval: -1        # -1 = save at end only
+
+  # PLY export
+  ply_format: "binary"         # "ascii" or "binary"
+  include_intensity: true
+  include_rgb: false
+
+# Wheel odometry (optional)
+wheel_odom:
+  enabled: false
+  can_interface: "can0"
+  left_vesc_id: 1
+  right_vesc_id: 2
+  motor_poles: 14
+  gear_ratio: 5.0
+  wheel_diameter: 0.165        # meters
+  wheel_base: 0.5              # meters
+  noise: 0.05

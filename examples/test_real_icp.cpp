@@ -178,8 +178,9 @@ bool runMultiScaleTest(const std::string& name,
     MultiScaleICP ms_icp;
 
     auto start = std::chrono::high_resolution_clock::now();
+    // Bunny is ~0.15m, so use appropriate voxel sizes (mm scale)
     ICPResult result = ms_icp.align(source, target, M4D::Identity(),
-                                    {8.0, 4.0, 2.0, 1.0},  // Voxel scale factors
+                                    {0.012, 0.006, 0.003},  // Absolute voxel sizes in meters
                                     ICPMethod::POINT_TO_PLANE);
     auto end = std::chrono::high_resolution_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();

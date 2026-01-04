@@ -32,7 +32,9 @@
 #include <Eigen/Eigenvalues>
 
 #include "slam/types.hpp"
+#ifdef HAS_PCL
 #include "slam/ikd-Tree/ikd_Tree.h"
+#endif
 
 namespace slam {
 
@@ -300,6 +302,7 @@ public:
         }
     }
 
+#ifdef HAS_PCL
     /**
      * @brief Align source to target using ikd-tree for efficient NN search
      */
@@ -382,6 +385,7 @@ public:
 
         return result;
     }
+#endif // HAS_PCL
 
     void setConfig(const ICPConfig& config) { config_ = config; }
     const ICPConfig& getConfig() const { return config_; }
@@ -853,6 +857,7 @@ public:
         return result;
     }
 
+#ifdef HAS_PCL
     /**
      * @brief Multi-scale ICP with ikd-tree
      */
@@ -885,6 +890,7 @@ public:
 
         return result;
     }
+#endif // HAS_PCL
 };
 
 } // namespace slam

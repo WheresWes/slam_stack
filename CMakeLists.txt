@@ -204,6 +204,14 @@ if(BUILD_EXAMPLES)
         slam_engine
     )
 
+    # Global localization test
+    add_executable(test_global_localization
+        examples/test_global_localization.cpp
+    )
+    target_link_libraries(test_global_localization
+        slam_engine
+    )
+
     # Main SLAM application
     add_executable(slam_main
         examples/slam_main.cpp

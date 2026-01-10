@@ -24,6 +24,7 @@
 #include "slam/livox_mid360.hpp"
 #include "slam/slam_engine.hpp"
 #include "slam/types.hpp"
+#include "slam/visualization.hpp"
 
 using namespace slam;
 
@@ -50,6 +51,7 @@ void printUsage(const char* prog) {
     std::cout << "  --time <sec>     Run duration in seconds (default: 30, 0=unlimited)\n";
     std::cout << "  --output <name>  Output file prefix (default: live_slam)\n";
     std::cout << "  --voxel <size>   Map voxel size in meters (default: 0.1)\n";
+    std::cout << "  --visualize      Enable real-time visualization (requires Rerun)\n";
     std::cout << "  --help           Show this help\n";
 }
 
@@ -65,6 +67,7 @@ int main(int argc, char** argv) {
     std::string output_prefix = "live_slam";
     int run_seconds = 30;
     double voxel_size = 0.1;
+    bool enable_visualization = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -84,6 +87,8 @@ int main(int argc, char** argv) {
             output_prefix = argv[++i];
         } else if (arg == "--voxel" && i + 1 < argc) {
             voxel_size = std::atof(argv[++i]);
+        } else if (arg == "--visualize") {
+            enable_visualization = true;
         } else if (arg == "--help") {
             printUsage(argv[0]);
             return 0;
@@ -116,7 +121,28 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "  Voxel size: " << voxel_size << "m\n";
-    std::cout << "  Deskew: enabled\n\n";
+    std::cout << "  Deskew: enabled\n";
+
+    // Initialize visualization (if enabled)
+    std::unique_ptr<Visualizer> visualizer;
+    if (enable_visualization) {
+        VisualizerConfig viz_config;
+        viz_config.application_id = "live_slam";
+        viz_config.spawn_viewer = true;
+        viz_config.color_by_height = true;
+        viz_config.point_size = 2.0f;
+        viz_config.map_point_size = 1.5f;
+        viz_config.max_points_per_frame = 30000;
+
+        visualizer = std::make_unique<Visualizer>(viz_config);
+        if (visualizer->isInitialized()) {
+            std::cout << "  Visualization: enabled (Rerun)\n";
+        } else {
+            std::cout << "  Visualization: failed to initialize\n";
+            visualizer.reset();
+        }
+    }
+    std::cout << "\n";
 
     // Initialize Livox driver
     LivoxMid360 lidar;
@@ -246,18 +272,49 @@ int main(int argc, char** argv) {
     // Main loop - process SLAM and display status
     auto start_time = std::chrono::steady_clock::now();
     auto last_status_time = start_time;
+    auto last_viz_time = start_time;
     uint64_t last_points = 0;
     uint64_t last_imu = 0;
+    std::vector<V3D> trajectory_positions;
 
     while (g_running) {
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
 
         if (run_seconds > 0 && elapsed >= run_seconds) break;
 
         // Process any available buffered sensor data
         // This syncs IMU + LiDAR and runs the SLAM optimization
-        g_slam->process();
+        int processed = g_slam->process();
+
+        // Update visualization after processing
+        if (visualizer && processed > 0) {
+            // Set timeline
+            visualizer->setTime("slam_time", elapsed_ms / 1000.0);
+
+            // Log current pose
+            SlamState state = g_slam->getState();
+            visualizer->logPose("world/robot", state);
+
+            // Log coordinate frame at robot position
+            visualizer->logCoordinateFrame("world/robot/frame", 0.3f);
+
+            // Add to trajectory and log
+            trajectory_positions.push_back(state.pos);
+            if (trajectory_positions.size() > 1) {
+                visualizer->logTrajectory("world/trajectory", trajectory_positions);
+            }
+        }
+
+        // Update map visualization periodically (every 500ms)
+        auto viz_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_viz_time).count();
+        if (visualizer && viz_elapsed >= 500) {
+            // Get map points from SLAM and visualize
+            // For now just log the trajectory - map visualization can be added later
+            // since getting raw map points requires additional API
+            last_viz_time = now;
+        }
 
         // Sleep briefly to not spin too fast
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

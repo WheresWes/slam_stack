@@ -74,6 +74,16 @@ if(yaml-cpp_FOUND)
     message(STATUS "Found yaml-cpp")
 endif()
 
+# nanoflann (header-only kd-tree, for fast nearest neighbor)
+find_package(nanoflann CONFIG QUIET)
+if(nanoflann_FOUND)
+    message(STATUS "Found nanoflann - fast kd-tree enabled")
+    set(HAS_NANOFLANN TRUE)
+else()
+    message(STATUS "nanoflann not found - using brute-force NN")
+    set(HAS_NANOFLANN FALSE)
+endif()
+
 # PCL (optional, for point cloud processing and ikd-tree)
 find_package(PCL 1.8 QUIET COMPONENTS common filters)
 if(PCL_FOUND)
@@ -151,6 +161,16 @@ if(OpenMP_CXX_FOUND)
     endif()
 endif()
 
+if(HAS_NANOFLANN)
+    if(HAS_PCL)
+        target_link_libraries(slam_engine PUBLIC nanoflann::nanoflann)
+        target_compile_definitions(slam_engine PUBLIC HAS_NANOFLANN)
+    else()
+        target_link_libraries(slam_engine INTERFACE nanoflann::nanoflann)
+        target_compile_definitions(slam_engine INTERFACE HAS_NANOFLANN)
+    endif()
+endif()
+
 #==============================================================================
 # Examples
 #==============================================================================
@@ -211,6 +231,36 @@ if(BUILD_EXAMPLES)
     target_link_libraries(test_global_localization
         slam_engine
     )
+
+    # Global localization benchmark
+    add_executable(benchmark_global_localization
+        examples/benchmark_global_localization.cpp
+    )
+    target_link_libraries(benchmark_global_localization
+        slam_engine
+    )
+
+    # Livox Mid-360 connection test
+    add_executable(test_livox_connection
+        examples/test_livox_connection.cpp
+    )
+    target_link_libraries(test_livox_connection
+        slam_engine
+    )
+    if(WIN32)
+        target_link_libraries(test_livox_connection ws2_32)
+    endif()
+
+    # Live SLAM with native Livox driver
+    add_executable(live_slam
+        examples/live_slam.cpp
+    )
+    target_link_libraries(live_slam
+        slam_engine
+    )
+    if(WIN32)
+        target_link_libraries(live_slam ws2_32)
+    endif()
 
     # Main SLAM application
     add_executable(slam_main

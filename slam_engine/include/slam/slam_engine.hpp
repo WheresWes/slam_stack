@@ -167,6 +167,16 @@ public:
      */
     void processMeasurement(MeasureGroup& meas);
 
+    /**
+     * @brief Process all available buffered sensor data
+     *
+     * Call this periodically after adding IMU and point cloud data.
+     * It will sync and process all complete measurement groups.
+     *
+     * @return Number of measurements processed
+     */
+    int process();
+
     //=========================================================================
     // State Output
     //=========================================================================
@@ -605,6 +615,23 @@ inline bool SlamEngine::syncPackages(MeasureGroup& meas) {
     lidar_pushed_ = false;
 
     return true;
+}
+
+inline int SlamEngine::process() {
+    int count = 0;
+    MeasureGroup meas;
+    meas.lidar = std::make_shared<PointCloud>();
+
+    while (syncPackages(meas)) {
+        processMeasurement(meas);
+        count++;
+
+        // Reset for next iteration
+        meas.lidar = std::make_shared<PointCloud>();
+        meas.imu.clear();
+    }
+
+    return count;
 }
 
 inline void SlamEngine::processMeasurement(MeasureGroup& meas) {

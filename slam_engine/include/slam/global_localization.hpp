@@ -29,6 +29,7 @@
 
 #include "slam/types.hpp"
 #include "slam/icp.hpp"
+#include "slam/icp_accelerated.hpp"
 
 namespace slam {
 
@@ -1076,7 +1077,11 @@ public:
         auto scan_down = voxelDownsample(scan, config_.coarse_voxel_size);
         auto map_down = voxelDownsample(map_points_, config_.coarse_voxel_size);
 
+#ifdef HAS_NANOFLANN
+        ICPAccelerated coarse_icp(coarse_icp_config);
+#else
         ICP coarse_icp(coarse_icp_config);
+#endif
 
         for (const auto& c : candidates) {
             M4D initial_pose = constructPose(c.position, c.yaw);
@@ -1115,7 +1120,11 @@ public:
         auto scan_medium = voxelDownsample(scan, config_.medium_voxel_size);
         auto map_medium = voxelDownsample(map_points_, config_.medium_voxel_size);
 
+#ifdef HAS_NANOFLANN
+        ICPAccelerated medium_icp(medium_icp_config);
+#else
         ICP medium_icp(medium_icp_config);
+#endif
 
         for (auto& vc : verified) {
             auto icp_result = medium_icp.align(scan_medium, map_medium, vc.pose);
@@ -1148,7 +1157,11 @@ public:
         auto scan_fine = voxelDownsample(scan, config_.fine_voxel_size);
         auto map_fine = voxelDownsample(map_points_, config_.fine_voxel_size);
 
+#ifdef HAS_NANOFLANN
+        ICPAccelerated fine_icp(fine_icp_config);
+#else
         ICP fine_icp(fine_icp_config);
+#endif
 
         for (auto& vc : verified) {
             auto icp_result = fine_icp.align(scan_fine, map_fine, vc.pose);

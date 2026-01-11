@@ -267,10 +267,36 @@ public:
     {
     private:
         int head = 0, tail = 0, counter = 0;
-        Operation_Logger_Type q[Q_LEN];
-        bool is_empty;
+        Operation_Logger_Type* q = nullptr;  // Heap-allocated to avoid stack overflow
+        bool is_empty = true;
 
     public:
+        MANUAL_Q() {
+            q = new Operation_Logger_Type[Q_LEN];
+        }
+        ~MANUAL_Q() {
+            delete[] q;
+        }
+        // Disable copy to prevent double-free
+        MANUAL_Q(const MANUAL_Q&) = delete;
+        MANUAL_Q& operator=(const MANUAL_Q&) = delete;
+        // Allow move
+        MANUAL_Q(MANUAL_Q&& other) noexcept : head(other.head), tail(other.tail), counter(other.counter), q(other.q), is_empty(other.is_empty) {
+            other.q = nullptr;
+        }
+        MANUAL_Q& operator=(MANUAL_Q&& other) noexcept {
+            if (this != &other) {
+                delete[] q;
+                head = other.head;
+                tail = other.tail;
+                counter = other.counter;
+                q = other.q;
+                is_empty = other.is_empty;
+                other.q = nullptr;
+            }
+            return *this;
+        }
+
         void pop()
         {
             if (counter == 0)

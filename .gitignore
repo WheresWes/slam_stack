@@ -36,3 +36,8 @@ Thumbs.db
 *.log
 *.swp
 *~
+
+# Data files (point clouds, recordings)
+*.ply
+*.bin
+*.pcd

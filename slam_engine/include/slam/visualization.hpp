@@ -241,11 +241,22 @@ inline bool Visualizer::init(const VisualizerConfig& config) {
         // Create recording stream
         rec_ = std::make_unique<rerun::RecordingStream>(config_.application_id);
 
+        bool connected = false;
+
+        // Try connecting to existing viewer first
         if (!config_.connect_addr.empty()) {
-            // Connect to remote viewer via gRPC
-            rec_->connect_grpc(config_.connect_addr).exit_on_failure();
-        } else if (config_.spawn_viewer) {
-            // Spawn local viewer
+            auto result = rec_->connect_grpc(config_.connect_addr);
+            if (result.is_ok()) {
+                std::cout << "[Visualizer] Connected to existing viewer at " << config_.connect_addr << std::endl;
+                connected = true;
+            } else {
+                std::cout << "[Visualizer] No existing viewer at " << config_.connect_addr << std::endl;
+            }
+        }
+
+        // Spawn viewer if not connected and spawn_viewer is true
+        if (!connected && config_.spawn_viewer) {
+            std::cout << "[Visualizer] Spawning new viewer..." << std::endl;
             rec_->spawn().exit_on_failure();
         }
 

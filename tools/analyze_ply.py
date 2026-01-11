@@ -32,13 +32,34 @@ def analyze_ply(filename):
         if not is_binary or num_points == 0:
             return
 
-        # Read binary point data (3 floats per point = 12 bytes)
+        # Count properties from header
+        properties = []
+        for line in header_lines:
+            if line.startswith('property float'):
+                properties.append(line.split()[-1])
+            elif line.startswith('property uchar'):
+                properties.append('uchar:' + line.split()[-1])
+
+        # Calculate bytes per point
+        bytes_per_point = 0
+        for prop in properties:
+            if prop.startswith('uchar:'):
+                bytes_per_point += 1
+            else:
+                bytes_per_point += 4  # float
+
+        print(f"Properties: {properties}")
+        print(f"Bytes per point: {bytes_per_point}")
+        print()
+
+        # Read binary point data
         points = []
         for i in range(num_points):
-            data = f.read(12)
-            if len(data) < 12:
+            data = f.read(bytes_per_point)
+            if len(data) < bytes_per_point:
                 break
-            x, y, z = struct.unpack('<fff', data)
+            # First 3 floats are always x, y, z
+            x, y, z = struct.unpack('<fff', data[:12])
             points.append((x, y, z))
 
         if not points:

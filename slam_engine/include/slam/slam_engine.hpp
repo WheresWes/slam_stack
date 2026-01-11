@@ -67,16 +67,24 @@ struct SlamConfig {
     // Map parameters
     double filter_size_surf = 0.5;      // Downsampling voxel size for scan
     double filter_size_map = 0.5;       // Map voxel size
-    double cube_len = 200.0;            // Local map cube size
-    double det_range = 300.0;           // Detection range
-    double fov_deg = 180.0;             // Field of view
+    double cube_len = 200.0;            // Local map cube size (original FAST-LIO default)
+    double det_range = 40.0;            // Detection range (Mid-360: 40m)
+    double fov_deg = 59.0;              // Vertical FOV (Mid-360: -7° to +52° = 59°)
+                                        // Note: Not used in algorithm, kept for documentation
 
     // Optimization
-    int max_iterations = 4;
+    int max_iterations = 5;             // 5 recommended for motion (original FAST-LIO uses 3-4)
+    int max_points_icp = 0;             // Max points for IEKF matching (0 = unlimited)
+    int max_map_points = 0;             // Max map points (0 = unlimited, uses cube_len for spatial limits)
 
-    // LiDAR-IMU extrinsics
-    V3D extrinsic_T = V3D::Zero();
-    M3D extrinsic_R = M3D::Identity();
+    // LiDAR-IMU extrinsics (Mid-360 defaults from FAST-LIO)
+    // extrinsic_T: translation of LiDAR in IMU frame [meters]
+    // extrinsic_R: rotation from LiDAR to IMU frame
+    V3D extrinsic_T = V3D(-0.011, -0.0234, 0.044);  // Mid-360 offset
+    M3D extrinsic_R = (M3D() <<
+        0.9999161,  0.0026676,  0.0126707,
+        -0.0025826, 0.9999741, -0.0067201,
+        -0.0126883, 0.0066868,  0.9998971).finished();
     bool extrinsic_est_en = false;
 
     // Motion compensation
@@ -95,6 +103,26 @@ struct SlamConfig {
 using StateCallback = std::function<void(const SlamState&)>;
 using PointCloudCallback = std::function<void(const PointCloud&, const M4D&)>;
 using TrajectoryCallback = std::function<void(const std::vector<M4D>&)>;
+
+// Debug timing for performance analysis
+struct SlamDebugTiming {
+    double sync_us = 0;
+    double imu_process_us = 0;
+    double downsample_us = 0;
+    double icp_us = 0;
+    double map_update_us = 0;
+    double total_us = 0;
+    int imu_count = 0;
+    int points_in = 0;
+    int points_after_ds = 0;
+
+    // Alignment quality metrics (for iteration count comparison)
+    int iterations_used = 0;        // Actual IEKF iterations this scan
+    bool converged_early = false;   // Converged before max_iterations
+    double avg_residual = 0.0;      // Average point-to-plane residual (meters)
+    double max_residual = 0.0;      // Max point-to-plane residual
+    int valid_correspondences = 0;  // Points with valid plane fits
+};
 
 //=============================================================================
 // SLAM Engine Class
@@ -205,6 +233,11 @@ public:
      * @brief Check if SLAM is initialized
      */
     bool isInitialized() const { return ekf_initialized_; }
+
+    /**
+     * @brief Get debug timing from last process() call
+     */
+    SlamDebugTiming getDebugTiming() const { return debug_timing_; }
 
     //=========================================================================
     // Map Access
@@ -367,6 +400,10 @@ private:
     double lidar_mean_scantime_ = 0.1;
     int scan_num_ = 0;
 
+    // Store pushed lidar data across sync calls (fix for non-blocking process())
+    PointCloudPtr pending_lidar_;
+    double pending_lidar_beg_time_ = 0;
+
     //=========================================================================
     // Processing Components
     //=========================================================================
@@ -382,6 +419,9 @@ private:
     double first_lidar_time_ = 0;
     bool first_scan_ = true;
 
+    // Debug timing
+    SlamDebugTiming debug_timing_;
+
     //=========================================================================
     // Map
     //=========================================================================
@@ -391,8 +431,8 @@ private:
 
     // Nearest points for each feature
     std::vector<PointVector> nearest_points_;
-    bool point_selected_surf_[100000];
-    float res_last_[100000];
+    std::vector<bool> point_selected_surf_;
+    std::vector<float> res_last_;
 
     //=========================================================================
     // Point Cloud Buffers (PCL-compatible for ikd-tree)
@@ -444,9 +484,9 @@ inline SlamEngine::SlamEngine() {
     laser_cloud_ori_.reset(new pcl::PointCloud<PointType>(100000, 1));
     corr_normvect_.reset(new pcl::PointCloud<PointType>(100000, 1));
 
-    // Initialize selection arrays
-    std::fill(point_selected_surf_, point_selected_surf_ + 100000, true);
-    std::fill(res_last_, res_last_ + 100000, -1000.0f);
+    // Initialize selection arrays (heap-allocated vectors to avoid stack overflow)
+    point_selected_surf_.resize(100000, true);
+    res_last_.resize(100000, -1000.0f);
 }
 
 inline SlamEngine::~SlamEngine() {
@@ -550,7 +590,7 @@ inline void SlamEngine::addPointCloud(const PointCloud& cloud) {
 
     last_timestamp_lidar_ = timestamp;
 
-    // Convert to PCL format (preserving intensity)
+    // Copy to PCL format (preserving intensity)
     auto pcl_cloud = std::make_shared<PointCloud>(cloud);
     lidar_buffer_.push_back(pcl_cloud);
     time_buffer_.push_back(timestamp);
@@ -570,36 +610,42 @@ inline bool SlamEngine::syncPackages(MeasureGroup& meas) {
 
     if (!lidar_pushed_) {
         auto& front_cloud = lidar_buffer_.front();
-        meas.lidar_beg_time = time_buffer_.front();
+        pending_lidar_beg_time_ = time_buffer_.front();
 
-        // Convert our PointCloud to internal format
-        meas.lidar->clear();
-        meas.lidar->points.reserve(front_cloud->size());
+        // Copy to persistent pending_lidar_ (stored across process() calls)
+        pending_lidar_ = std::make_shared<PointCloud>();
+        pending_lidar_->points.reserve(front_cloud->size());
+        pending_lidar_->timestamp_ns = front_cloud->timestamp_ns;
         for (const auto& pt : front_cloud->points) {
-            meas.lidar->push_back(pt);
+            pending_lidar_->push_back(pt);
         }
 
-        if (meas.lidar->size() <= 1) {
-            lidar_end_time_ = meas.lidar_beg_time + lidar_mean_scantime_;
+        if (pending_lidar_->size() <= 1) {
+            lidar_end_time_ = pending_lidar_beg_time_ + lidar_mean_scantime_;
         } else {
             // Use time offset from last point
-            float last_time_offset = meas.lidar->points.back().time_offset_ms / 1000.0;
+            float last_time_offset = pending_lidar_->points.back().time_offset_ms / 1000.0;
             if (last_time_offset < 0.5 * lidar_mean_scantime_) {
-                lidar_end_time_ = meas.lidar_beg_time + lidar_mean_scantime_;
+                lidar_end_time_ = pending_lidar_beg_time_ + lidar_mean_scantime_;
             } else {
                 scan_num_++;
-                lidar_end_time_ = meas.lidar_beg_time + last_time_offset;
+                lidar_end_time_ = pending_lidar_beg_time_ + last_time_offset;
                 lidar_mean_scantime_ += (last_time_offset - lidar_mean_scantime_) / scan_num_;
             }
         }
 
-        meas.lidar_end_time = lidar_end_time_;
         lidar_pushed_ = true;
     }
 
+    // Check if we have enough IMU data
     if (last_timestamp_imu_ < lidar_end_time_) {
         return false;
     }
+
+    // Now copy the pending lidar to meas (this persists across process() calls)
+    meas.lidar_beg_time = pending_lidar_beg_time_;
+    meas.lidar_end_time = lidar_end_time_;
+    meas.lidar = pending_lidar_;  // Just copy the shared_ptr
 
     // Push IMU data
     meas.imu.clear();
@@ -613,6 +659,7 @@ inline bool SlamEngine::syncPackages(MeasureGroup& meas) {
     lidar_buffer_.pop_front();
     time_buffer_.pop_front();
     lidar_pushed_ = false;
+    pending_lidar_.reset();  // Clear the pending lidar
 
     return true;
 }
@@ -635,7 +682,12 @@ inline int SlamEngine::process() {
 }
 
 inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
+    auto total_start = std::chrono::high_resolution_clock::now();
+
     if (meas.imu.empty() || meas.lidar->empty()) return;
+
+    debug_timing_.imu_count = static_cast<int>(meas.imu.size());
+    debug_timing_.points_in = static_cast<int>(meas.lidar->size());
 
     if (first_scan_) {
         first_lidar_time_ = meas.lidar_beg_time;
@@ -645,11 +697,13 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
     }
 
     // Convert our PointCloud to PCL format for IMU processing
-    // This is needed because the EKF uses PCL types internally
     auto pcl_undistort = std::make_shared<PointCloud>();
 
     // Process IMU + undistort points
+    auto imu_start = std::chrono::high_resolution_clock::now();
     imu_processor_->process(meas, kf_, pcl_undistort);
+    auto imu_end = std::chrono::high_resolution_clock::now();
+    debug_timing_.imu_process_us = std::chrono::duration<double, std::micro>(imu_end - imu_start).count();
 
     // Convert back to PCL for rest of processing
     feats_undistort_->clear();
@@ -674,17 +728,43 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
     // Check if EKF is initialized (after INIT_TIME seconds)
     ekf_initialized_ = (meas.lidar_beg_time - first_lidar_time_) > 0.1;
 
-    // Manage local map FOV
-    lasermapFovSegment();
+    // NOTE: lasermapFovSegment moved to AFTER initial map building
+    // to prevent deleting points before the map exists
 
     // Downsample
+    auto ds_start = std::chrono::high_resolution_clock::now();
     down_size_filter_surf_.setInputCloud(feats_undistort_);
     down_size_filter_surf_.filter(*feats_down_body_);
     feats_down_size_ = feats_down_body_->points.size();
 
+    // Limit points for ICP to maintain real-time performance (0 = unlimited)
+    if (config_.max_points_icp > 0 && feats_down_size_ > static_cast<size_t>(config_.max_points_icp)) {
+        // Uniform subsampling to reduce to max_points_icp
+        int step = (feats_down_size_ + config_.max_points_icp - 1) / config_.max_points_icp;
+        if (step < 2) step = 2;
+        pcl::PointCloud<PointType>::Ptr subsampled(new pcl::PointCloud<PointType>);
+        subsampled->reserve(config_.max_points_icp);
+        for (size_t i = 0; i < feats_down_body_->size() && subsampled->size() < static_cast<size_t>(config_.max_points_icp); i += step) {
+            subsampled->push_back(feats_down_body_->points[i]);
+        }
+        feats_down_body_ = subsampled;
+        feats_down_size_ = feats_down_body_->points.size();
+    }
+
+    auto ds_end = std::chrono::high_resolution_clock::now();
+    debug_timing_.downsample_us = std::chrono::duration<double, std::micro>(ds_end - ds_start).count();
+    debug_timing_.points_after_ds = feats_down_size_;
+
     // Initialize map if needed
     if (ikdtree_.Root_Node == nullptr) {
         if (feats_down_size_ > 5) {
+            // Reset EKF position to origin for first map
+            state_ikfom reset_state = kf_.get_x();
+            reset_state.pos = V3D(0, 0, 0);
+            reset_state.vel = V3D(0, 0, 0);
+            kf_.change_x(reset_state);
+            state_point_ = kf_.get_x();
+
             feats_down_world_->resize(feats_down_size_);
             for (int i = 0; i < feats_down_size_; i++) {
                 WorldPoint wp;
@@ -700,7 +780,17 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
                 feats_down_world_->points[i].z = wp.z;
                 feats_down_world_->points[i].intensity = wp.intensity;
             }
+
             ikdtree_.Build(feats_down_world_->points);
+
+            // Initialize local map bounds at origin
+            for (int i = 0; i < 3; i++) {
+                local_map_points_.vertex_min[i] = -config_.cube_len / 2.0;
+                local_map_points_.vertex_max[i] = config_.cube_len / 2.0;
+            }
+            localmap_initialized_ = true;
+
+            std::cout << "[SlamEngine] Map initialized with " << feats_down_size_ << " points" << std::endl;
         }
         return;
     }
@@ -710,21 +800,34 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
         return;
     }
 
+    // Manage local map FOV (only after tree exists)
+    lasermapFovSegment();
+
     // Resize buffers
     normvec_->resize(feats_down_size_);
     feats_down_world_->resize(feats_down_size_);
     nearest_points_.resize(feats_down_size_);
 
-    // EKF update
+    // EKF update (ICP iteration)
+    auto icp_start = std::chrono::high_resolution_clock::now();
     double solve_H_time = 0;
     kf_.update_iterated_dyn_share_modified(0.001, solve_H_time);
+    auto icp_end = std::chrono::high_resolution_clock::now();
+    debug_timing_.icp_us = std::chrono::duration<double, std::micro>(icp_end - icp_start).count();
 
     state_point_ = kf_.get_x();
 
     // Add points to map (skip in localization mode)
+    auto map_start = std::chrono::high_resolution_clock::now();
     if (!localization_mode_) {
         mapIncremental();
     }
+    auto map_end = std::chrono::high_resolution_clock::now();
+    debug_timing_.map_update_us = std::chrono::duration<double, std::micro>(map_end - map_start).count();
+
+    // Total time
+    auto total_end = std::chrono::high_resolution_clock::now();
+    debug_timing_.total_us = std::chrono::duration<double, std::micro>(total_end - total_start).count();
 
     // Update trajectory
     {
@@ -817,15 +920,43 @@ inline void SlamEngine::lasermapFovSegment() {
     local_map_points_ = new_local_map;
 
     if (!cub_needrm.empty()) {
-        ikdtree_.Delete_Point_Boxes(cub_needrm);
+        // Check if deletion boxes would remove too many points (bug protection)
+        bool boxes_too_large = false;
+        for (const auto& box : cub_needrm) {
+            for (int i = 0; i < 3; i++) {
+                float box_size = box.vertex_max[i] - box.vertex_min[i];
+                float map_size = local_map_points_.vertex_max[i] - local_map_points_.vertex_min[i];
+                if (box_size > map_size * 0.5f) {
+                    boxes_too_large = true;
+                    break;
+                }
+            }
+            if (boxes_too_large) break;
+        }
+
+        if (!boxes_too_large) {
+            ikdtree_.Delete_Point_Boxes(cub_needrm);
+        }
     }
 }
 
 inline void SlamEngine::mapIncremental() {
+    // Skip map update if map is at max size (prevents unbounded growth)
+    if (config_.max_map_points > 0 && ikdtree_.validnum() >= static_cast<size_t>(config_.max_map_points)) {
+        return;  // Map is full, rely on FOV pruning to make room
+    }
+
     PointVector point_to_add;
     PointVector point_no_need_downsample;
     point_to_add.reserve(feats_down_size_);
     point_no_need_downsample.reserve(feats_down_size_);
+
+    // DEBUG: Track corruption
+    static int debug_frame = 0;
+    static int corrupt_count_total = 0;
+    int corrupt_this_frame = 0;
+    double max_dist_body = 0;
+    double max_dist_world = 0;
 
     for (int i = 0; i < feats_down_size_; i++) {
         // Transform to world frame (preserving intensity)
@@ -842,6 +973,24 @@ inline void SlamEngine::mapIncremental() {
         point_world.y = p_global(1);
         point_world.z = p_global(2);
         point_world.intensity = point_body.intensity;  // PRESERVE INTENSITY
+
+        // DEBUG: Check for corruption
+        double body_dist = p_body.norm();
+        double world_dist = p_global.norm();
+        if (body_dist > max_dist_body) max_dist_body = body_dist;
+        if (world_dist > max_dist_world) max_dist_world = world_dist;
+
+        // Flag if world point is far but body point was close (indicates transform issue)
+        if (world_dist > 50.0 && body_dist < 50.0) {
+            corrupt_this_frame++;
+            if (corrupt_count_total < 10) {  // Only print first 10 occurrences
+                std::cerr << "[DEBUG CORRUPT] Body: [" << p_body.x() << "," << p_body.y() << "," << p_body.z()
+                          << "] (d=" << body_dist << ") -> World: [" << p_global.x() << "," << p_global.y() << "," << p_global.z()
+                          << "] (d=" << world_dist << ")" << std::endl;
+                std::cerr << "  State pos: [" << state_point_.pos[0] << "," << state_point_.pos[1] << "," << state_point_.pos[2] << "]" << std::endl;
+            }
+            corrupt_count_total++;
+        }
 
         // Decide if need to add to map
         if (!nearest_points_[i].empty() && ekf_initialized_) {
@@ -882,6 +1031,16 @@ inline void SlamEngine::mapIncremental() {
         } else {
             point_to_add.push_back(point_world);
         }
+    }
+
+    // DEBUG: Summary every 50 frames
+    debug_frame++;
+    if (debug_frame % 50 == 0 || corrupt_this_frame > 0) {
+        std::cout << "[DEBUG mapIncr] Frame " << debug_frame
+                  << ": body_max=" << max_dist_body << "m, world_max=" << max_dist_world << "m"
+                  << ", corrupt=" << corrupt_this_frame << " (total=" << corrupt_count_total << ")"
+                  << ", adding=" << point_to_add.size() << "+" << point_no_need_downsample.size()
+                  << std::endl;
     }
 
     ikdtree_.Add_Points(point_to_add, true);
@@ -1057,6 +1216,26 @@ inline std::vector<WorldPoint> SlamEngine::getMapPoints() const {
 
     PointVector storage;
     ikdtree_.flatten(ikdtree_.Root_Node, storage, NOT_RECORD);
+
+    // DEBUG: Analyze point distribution
+    double max_dist = 0;
+    int far_count = 0;
+    int nan_count = 0;
+    for (const auto& pt : storage) {
+        if (std::isnan(pt.x) || std::isnan(pt.y) || std::isnan(pt.z)) {
+            nan_count++;
+            continue;
+        }
+        double d = std::sqrt(pt.x*pt.x + pt.y*pt.y + pt.z*pt.z);
+        if (d > max_dist) max_dist = d;
+        if (d > 50.0) far_count++;
+    }
+    if (max_dist > 50.0 || nan_count > 0) {
+        std::cout << "[DEBUG getMapPoints] total=" << storage.size()
+                  << ", max_dist=" << max_dist << "m"
+                  << ", far(>50m)=" << far_count
+                  << ", nan=" << nan_count << std::endl;
+    }
 
     points.reserve(storage.size());
     for (const auto& pt : storage) {

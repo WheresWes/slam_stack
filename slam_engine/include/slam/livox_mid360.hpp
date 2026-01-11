@@ -206,6 +206,7 @@ struct LivoxPointCloudFrame {
     std::vector<V3D> points;
     std::vector<uint8_t> reflectivities;
     std::vector<uint8_t> tags;
+    std::vector<float> time_offsets_us;  // Per-point time offset from timestamp_ns (microseconds)
 };
 
 struct LivoxIMUFrame {
@@ -337,6 +338,7 @@ public:
 
     /**
      * Scan for Livox devices on the network using broadcast discovery.
+     * Falls back to direct IP probing if broadcast fails.
      * @param timeout_ms How long to wait for responses (default 2 seconds)
      * @param host_ip Local IP address to bind to (empty = auto-detect)
      * @return Vector of discovered devices
@@ -357,14 +359,14 @@ public:
         setsockopt(sock, SOL_SOCKET, SO_BROADCAST,
                    (const char*)&broadcast_enable, sizeof(broadcast_enable));
 
-        // Set receive timeout
+        // Short timeout for individual probes
         #ifdef _WIN32
-        DWORD timeout = timeout_ms;
+        DWORD timeout = 200;  // 200ms per probe
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
         #else
         struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        tv.tv_sec = 0;
+        tv.tv_usec = 200000;  // 200ms
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         #endif
 
@@ -384,10 +386,12 @@ public:
             return devices;
         }
 
-        // Build discovery request (minimal header with CMD_DEVICE_QUERY)
+        // Build discovery request
         std::vector<uint8_t> request = buildDiscoveryRequest();
 
-        // Send broadcast to 255.255.255.255:56000
+        std::cout << "Scanning for Livox devices...\n";
+
+        // PHASE 1: Broadcast discovery
         sockaddr_in broadcast_addr = {};
         broadcast_addr.sin_family = AF_INET;
         broadcast_addr.sin_port = htons(livox::PORT_DISCOVERY);
@@ -396,14 +400,12 @@ public:
         sendto(sock, (const char*)request.data(), (int)request.size(), 0,
                (sockaddr*)&broadcast_addr, sizeof(broadcast_addr));
 
-        std::cout << "Scanning for Livox devices...\n";
-
         // Also try direct subnet broadcast (192.168.1.255)
         inet_pton(AF_INET, "192.168.1.255", &broadcast_addr.sin_addr);
         sendto(sock, (const char*)request.data(), (int)request.size(), 0,
                (sockaddr*)&broadcast_addr, sizeof(broadcast_addr));
 
-        // Listen for responses
+        // Listen for broadcast responses
         uint8_t buffer[1024];
         sockaddr_in sender_addr;
         socklen_t sender_len = sizeof(sender_addr);
@@ -412,7 +414,7 @@ public:
         while (true) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
-            if (elapsed >= timeout_ms) break;
+            if (elapsed >= timeout_ms / 2) break;  // Use half time for broadcast
 
             int recv_len = recvfrom(sock, (char*)buffer, sizeof(buffer), 0,
                                     (sockaddr*)&sender_addr, &sender_len);
@@ -420,12 +422,10 @@ public:
             if (recv_len > 0) {
                 LivoxDeviceInfo info;
                 if (parseDiscoveryResponse(buffer, recv_len, info)) {
-                    // Get IP from sender address
                     char ip_str[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &sender_addr.sin_addr, ip_str, sizeof(ip_str));
                     info.ip_address = ip_str;
 
-                    // Check if not already in list
                     bool found = false;
                     for (const auto& d : devices) {
                         if (d.serial_number == info.serial_number) {
@@ -443,8 +443,111 @@ public:
             }
         }
 
+        // PHASE 2: Direct IP probing if broadcast found nothing
+        // Mid-360 IPs are typically 192.168.1.1XX where XX = last 2 digits of serial
+        if (devices.empty()) {
+            std::cout << "  Broadcast failed, trying direct IP probe...\n";
+
+            // Common Mid-360 IP range: 192.168.1.100 to 192.168.1.199
+            std::vector<std::string> probe_ips;
+            for (int i = 100; i <= 199; i++) {
+                probe_ips.push_back("192.168.1." + std::to_string(i));
+            }
+
+            // First, send "reset to standby" commands to wake up devices stuck in streaming mode
+            std::vector<uint8_t> standby_cmd = buildStandbyCommand();
+
+            for (const auto& ip : probe_ips) {
+                sockaddr_in dev_addr = {};
+                dev_addr.sin_family = AF_INET;
+                dev_addr.sin_port = htons(livox::PORT_COMMAND);
+                inet_pton(AF_INET, ip.c_str(), &dev_addr.sin_addr);
+
+                // Send standby command (might wake up device from streaming mode)
+                sendto(sock, (const char*)standby_cmd.data(), (int)standby_cmd.size(), 0,
+                       (sockaddr*)&dev_addr, sizeof(dev_addr));
+            }
+
+            // Wait a moment for devices to process standby command
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            // Now probe each IP with discovery request
+            for (const auto& ip : probe_ips) {
+                sockaddr_in dev_addr = {};
+                dev_addr.sin_family = AF_INET;
+                dev_addr.sin_port = htons(livox::PORT_DISCOVERY);
+                inet_pton(AF_INET, ip.c_str(), &dev_addr.sin_addr);
+
+                sendto(sock, (const char*)request.data(), (int)request.size(), 0,
+                       (sockaddr*)&dev_addr, sizeof(dev_addr));
+            }
+
+            // Listen for responses with short timeout
+            start = std::chrono::steady_clock::now();
+            while (true) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                if (elapsed >= 500) break;  // 500ms for probing phase
+
+                int recv_len = recvfrom(sock, (char*)buffer, sizeof(buffer), 0,
+                                        (sockaddr*)&sender_addr, &sender_len);
+
+                if (recv_len > 0) {
+                    LivoxDeviceInfo info;
+                    if (parseDiscoveryResponse(buffer, recv_len, info)) {
+                        char ip_str[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &sender_addr.sin_addr, ip_str, sizeof(ip_str));
+                        info.ip_address = ip_str;
+
+                        bool found = false;
+                        for (const auto& d : devices) {
+                            if (d.serial_number == info.serial_number) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            devices.push_back(info);
+                            std::cout << "  Found (via probe): " << info.getTypeName()
+                                      << " [" << info.serial_number << "] at "
+                                      << info.ip_address << "\n";
+                        }
+                    }
+                }
+            }
+        }
+
         closesocket(sock);
         return devices;
+    }
+
+    /**
+     * Build a command to set device to standby mode (for waking up stuck devices)
+     */
+    std::vector<uint8_t> buildStandbyCommand() {
+        size_t data_len = 1 + 1 + 2 + 2 + 1;  // subcmd + key_num + key + len + value
+        size_t frame_size = 11 + data_len + 4;
+        std::vector<uint8_t> frame(frame_size, 0);
+
+        frame[0] = livox::FRAME_START;
+        frame[1] = 0;
+        *reinterpret_cast<uint16_t*>(&frame[2]) = static_cast<uint16_t>(frame_size);
+        *reinterpret_cast<uint16_t*>(&frame[4]) = cmd_seq_++;
+        frame[6] = livox::CMD_LIDAR;
+        frame[7] = livox::CMD_TYPE_REQ;
+        frame[8] = 0;
+        *reinterpret_cast<uint16_t*>(&frame[9]) = LivoxCRC::crc16(frame.data(), 9);
+
+        uint8_t* data = frame.data() + 11;
+        data[0] = livox::SUBCMD_PARAM_CONFIG;
+        data[1] = 1;
+        *reinterpret_cast<uint16_t*>(data + 2) = livox::PARAM_WORK_MODE;
+        *reinterpret_cast<uint16_t*>(data + 4) = 1;
+        data[6] = 0x01;  // Standby mode
+        *reinterpret_cast<uint32_t*>(&frame[frame_size - 4]) =
+            LivoxCRC::crc32(data, data_len);
+
+        return frame;
     }
 
     //=========================================================================
@@ -528,6 +631,21 @@ public:
      * Stop streaming.
      */
     void stop() {
+        if (!streaming_ && !connected_) return;
+
+        std::cout << "Stopping LiDAR...\n";
+
+        // Gracefully stop the LiDAR before closing sockets
+        if (cmd_socket_ != INVALID_SOCKET && connected_) {
+            // Disable point cloud sending first
+            sendParamCommandQuiet(livox::PARAM_POINT_SEND_EN, 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+            // Set work mode to Standby (0x01) so it responds to discovery next time
+            sendParamCommandQuiet(livox::PARAM_WORK_MODE, 0x01);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
         streaming_ = false;
         connected_ = false;
 
@@ -547,6 +665,8 @@ public:
             closesocket(cmd_socket_);
             cmd_socket_ = INVALID_SOCKET;
         }
+
+        std::cout << "LiDAR stopped cleanly.\n";
     }
 
     //=========================================================================
@@ -872,6 +992,41 @@ private:
         waitForAck(key);
     }
 
+    // Quiet version for use during shutdown (no debug output)
+    void sendParamCommandQuiet(uint16_t key, uint8_t value) {
+        if (cmd_socket_ == INVALID_SOCKET || device_ip_.empty()) return;
+
+        size_t data_len = 1 + 1 + 2 + 2 + 1;
+        size_t frame_size = 11 + data_len + 4;
+        std::vector<uint8_t> frame(frame_size, 0);
+
+        frame[0] = livox::FRAME_START;
+        frame[1] = 0;
+        *reinterpret_cast<uint16_t*>(&frame[2]) = static_cast<uint16_t>(frame_size);
+        *reinterpret_cast<uint16_t*>(&frame[4]) = cmd_seq_++;
+        frame[6] = livox::CMD_LIDAR;
+        frame[7] = livox::CMD_TYPE_REQ;
+        frame[8] = 0;
+        *reinterpret_cast<uint16_t*>(&frame[9]) = LivoxCRC::crc16(frame.data(), 9);
+
+        uint8_t* data = frame.data() + 11;
+        data[0] = livox::SUBCMD_PARAM_CONFIG;
+        data[1] = 1;
+        *reinterpret_cast<uint16_t*>(data + 2) = key;
+        *reinterpret_cast<uint16_t*>(data + 4) = 1;
+        data[6] = value;
+        *reinterpret_cast<uint32_t*>(&frame[frame_size - 4]) =
+            LivoxCRC::crc32(data, data_len);
+
+        sockaddr_in dev_addr = {};
+        dev_addr.sin_family = AF_INET;
+        dev_addr.sin_port = htons(livox::PORT_COMMAND);
+        inet_pton(AF_INET, device_ip_.c_str(), &dev_addr.sin_addr);
+
+        sendto(cmd_socket_, (const char*)frame.data(), (int)frame.size(), 0,
+               (sockaddr*)&dev_addr, sizeof(dev_addr));
+    }
+
     void waitForAck(uint16_t expected_key) {
         // Set socket to non-blocking temporarily
         u_long mode = 1;
@@ -974,7 +1129,20 @@ private:
         LivoxPointCloudFrame frame;
         frame.timestamp_ns = hdr->timestamp;
 
+        // Calculate per-point time offset
+        // time_interval is in 0.1 microseconds, convert to microseconds
+        float total_time_us = hdr->time_interval * 0.1f;
+        uint16_t total_points_in_packet = hdr->dot_num;
+
+        // Debug: Log time_interval values periodically
+        static int time_debug_count = 0;
+        if (time_debug_count++ < 5) {
+            std::cout << "[DEBUG time_interval] raw=" << hdr->time_interval
+                      << " -> " << total_time_us << "us, points=" << total_points_in_packet << std::endl;
+        }
+
         // Parse based on data type
+        static int unknown_type_count = 0;
         if (hdr->data_type == 1) {
             // 32-bit Cartesian (most common)
             size_t point_size = sizeof(LivoxPointCartesian32);
@@ -984,6 +1152,7 @@ private:
             frame.points.reserve(num_points);
             frame.reflectivities.reserve(num_points);
             frame.tags.reserve(num_points);
+            frame.time_offsets_us.reserve(num_points);
 
             for (size_t i = 0; i < num_points; i++) {
                 const LivoxPointCartesian32* pt =
@@ -998,6 +1167,10 @@ private:
                     frame.points.push_back(p);
                     frame.reflectivities.push_back(pt->reflectivity);
                     frame.tags.push_back(pt->tag);
+                    // Calculate time offset for this point (equally spaced within packet)
+                    float point_time_us = (total_points_in_packet > 1) ?
+                        (i * total_time_us / (total_points_in_packet - 1)) : 0.0f;
+                    frame.time_offsets_us.push_back(point_time_us);
                 }
             }
         }
@@ -1008,6 +1181,7 @@ private:
                                          point_data_len / point_size);
 
             frame.points.reserve(num_points);
+            frame.time_offsets_us.reserve(num_points);
 
             for (size_t i = 0; i < num_points; i++) {
                 const LivoxPointCartesian16* pt =
@@ -1021,7 +1195,18 @@ private:
                     frame.points.push_back(p);
                     frame.reflectivities.push_back(pt->reflectivity);
                     frame.tags.push_back(pt->tag);
+                    // Calculate time offset for this point (equally spaced within packet)
+                    float point_time_us = (total_points_in_packet > 1) ?
+                        (i * total_time_us / (total_points_in_packet - 1)) : 0.0f;
+                    frame.time_offsets_us.push_back(point_time_us);
                 }
+            }
+        }
+        else {
+            // Unknown/unsupported data type
+            if (unknown_type_count++ < 10) {
+                std::cerr << "[Livox] Unsupported data_type=" << (int)hdr->data_type
+                          << " (only types 1,2 supported). dot_num=" << hdr->dot_num << std::endl;
             }
         }
 

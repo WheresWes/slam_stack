@@ -32,6 +32,7 @@ option(BUILD_VISUALIZER "Build visualizer (requires Pangolin)" OFF)
 option(BUILD_WITH_LIVOX_SDK "Build with Livox SDK2 support" ON)
 option(BUILD_EXAMPLES "Build example applications" ON)
 option(BUILD_WITH_RERUN "Build with Rerun visualization" ON)
+option(BUILD_GUI "Build SLAM Control GUI" ON)
 
 #==============================================================================
 # Dependencies
@@ -110,6 +111,19 @@ else()
     set(HAS_PCL FALSE)
 endif()
 
+# Dear ImGui (optional, for GUI)
+if(BUILD_GUI)
+    find_package(imgui CONFIG QUIET)
+    if(imgui_FOUND)
+        message(STATUS "Found Dear ImGui - GUI enabled")
+        set(HAS_IMGUI TRUE)
+    else()
+        message(STATUS "Dear ImGui not found - GUI disabled")
+        set(HAS_IMGUI FALSE)
+        set(BUILD_GUI OFF)
+    endif()
+endif()
+
 #==============================================================================
 # Include Directories
 #==============================================================================
@@ -135,12 +149,19 @@ target_include_directories(slam_common INTERFACE
 
 if(HAS_PCL)
     # ikd-Tree source (needed for SLAM engine with PCL)
-    set(IKDTREE_SRC
+    set(SLAM_ENGINE_SRC
         ${PROJECT_SOURCE_DIR}/slam_engine/include/slam/ikd-Tree/ikd_Tree.cpp
     )
 
+    # Visualization source (separated for faster incremental builds)
+    if(HAS_RERUN)
+        list(APPEND SLAM_ENGINE_SRC
+            ${PROJECT_SOURCE_DIR}/slam_engine/src/visualization.cpp
+        )
+    endif()
+
     # SLAM engine library with PCL support
-    add_library(slam_engine ${IKDTREE_SRC})
+    add_library(slam_engine ${SLAM_ENGINE_SRC})
     target_include_directories(slam_engine PUBLIC
         ${PROJECT_SOURCE_DIR}/slam_engine/include
         ${EIGEN3_INCLUDE_DIR}
@@ -183,6 +204,12 @@ if(HAS_NANOFLANN)
         target_link_libraries(slam_engine INTERFACE nanoflann::nanoflann)
         target_compile_definitions(slam_engine INTERFACE HAS_NANOFLANN)
     endif()
+endif()
+
+# Rerun visualization support (linked to slam_engine for PIMPL pattern)
+if(HAS_RERUN AND HAS_PCL)
+    target_link_libraries(slam_engine PUBLIC rerun_sdk)
+    target_compile_definitions(slam_engine PUBLIC HAS_RERUN)
 endif()
 
 #==============================================================================
@@ -280,6 +307,49 @@ if(BUILD_EXAMPLES)
         target_compile_definitions(live_slam PRIVATE HAS_RERUN)
     endif()
 
+    # Replay SLAM (for offline testing with recorded data)
+    add_executable(replay_slam
+        examples/replay_slam.cpp
+    )
+    target_link_libraries(replay_slam
+        slam_engine
+    )
+    if(HAS_RERUN)
+        target_link_libraries(replay_slam rerun_sdk)
+        target_compile_definitions(replay_slam PRIVATE HAS_RERUN)
+    endif()
+
+    # Recording analyzer (diagnose tracking issues)
+    add_executable(analyze_recording
+        tools/analyze_recording.cpp
+    )
+    target_include_directories(analyze_recording PRIVATE
+        ${EIGEN3_INCLUDE_DIR}
+    )
+
+    # Simple SLAM test (no visualization)
+    add_executable(test_replay_simple
+        examples/test_replay_simple.cpp
+    )
+    target_link_libraries(test_replay_simple
+        slam_engine
+    )
+
+    # Minimal test to isolate stack overflow
+    add_executable(test_minimal
+        examples/test_minimal.cpp
+        ${PROJECT_SOURCE_DIR}/slam_engine/include/slam/ikd-Tree/ikd_Tree.cpp
+    )
+    target_include_directories(test_minimal PRIVATE
+        ${PROJECT_SOURCE_DIR}/slam_engine/include
+        ${EIGEN3_INCLUDE_DIR}
+        ${PCL_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_minimal
+        ${PCL_LIBRARIES}
+    )
+    target_compile_definitions(test_minimal PRIVATE HAS_PCL)
+
     # Main SLAM application
     add_executable(slam_main
         examples/slam_main.cpp
@@ -298,6 +368,25 @@ if(BUILD_EXAMPLES)
         )
         target_compile_definitions(slam_main PRIVATE LIVOX_SDK2_ENABLED)
     endif()
+endif()
+
+#==============================================================================
+# GUI Application
+#==============================================================================
+
+if(HAS_IMGUI AND WIN32)
+    add_executable(slam_control_gui WIN32
+        gui/slam_control_gui.cpp
+    )
+    target_link_libraries(slam_control_gui
+        imgui::imgui
+        d3d11
+    )
+    target_compile_definitions(slam_control_gui PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+    message(STATUS "Building SLAM Control GUI")
 endif()
 
 #==============================================================================
@@ -346,6 +435,7 @@ message(STATUS "  C++ Standard:    ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Livox SDK2:      ${BUILD_WITH_LIVOX_SDK}")
 message(STATUS "  Visualizer:      ${BUILD_VISUALIZER}")
 message(STATUS "  Rerun:           ${HAS_RERUN}")
+message(STATUS "  ImGui GUI:       ${HAS_IMGUI}")
 message(STATUS "  Tests:           ${BUILD_TESTS}")
 message(STATUS "  Examples:        ${BUILD_EXAMPLES}")
 message(STATUS "================================")

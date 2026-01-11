@@ -226,17 +226,22 @@ inline void ImuProcessor::setExtrinsic(const M4D& T) {
 }
 
 inline M3D ImuProcessor::computeGravityAlignment(const V3D& measured_gravity) {
-    // Normalize the measured gravity vector
-    V3D g_measured = measured_gravity.normalized();
+    // The accelerometer measures the REACTION to gravity, which points OPPOSITE
+    // to the actual gravity direction. When the sensor is level with Z up,
+    // the accelerometer reads [0, 0, +1g] (pointing up).
+    //
+    // We want to find rotation R such that the sensor's measured "up" direction
+    // aligns with world "up" direction (world +Z).
 
-    // World frame gravity direction (pointing down in -Z)
-    V3D g_world(0, 0, -1);
+    // Normalize the measured acceleration (points opposite to gravity = "up" in sensor frame)
+    V3D sensor_up = measured_gravity.normalized();
 
-    // Compute rotation that aligns measured gravity with world gravity
-    // R * g_measured = g_world
-    // This means: after applying R, the sensor's "down" becomes world "down"
+    // World "up" direction (+Z)
+    V3D world_up(0, 0, 1);
 
-    return rotationFromTwoVectors<double>(g_measured, g_world);
+    // Compute rotation that aligns sensor's "up" with world "up"
+    // R * sensor_up = world_up
+    return rotationFromTwoVectors<double>(sensor_up, world_up);
 }
 
 inline void ImuProcessor::imuInit(
@@ -348,6 +353,7 @@ inline void ImuProcessor::undistortPointCloud(
 
     // Copy and sort point cloud by time offset
     pcl_out = *meas.lidar;
+
     std::sort(pcl_out.points.begin(), pcl_out.points.end(),
               [](const LidarPoint& a, const LidarPoint& b) {
                   return a.time_offset_ms < b.time_offset_ms;
@@ -495,8 +501,14 @@ inline void ImuProcessor::process(
             std::cout << "[ImuProcessor] IMU initialization complete!" << std::endl;
             std::cout << "  Gravity magnitude: " << mean_acc_.norm() << " m/s^2" << std::endl;
             std::cout << "  Gyro bias: [" << mean_gyr_.transpose() << "] rad/s" << std::endl;
+
+            // Continue to process the first scan after init completes
+            // (fall through to undistortPointCloud below)
+        } else {
+            // Still initializing, return raw points
+            *pcl_undistorted = *meas.lidar;
+            return;
         }
-        return;
     }
 
     // Normal processing - undistort point cloud

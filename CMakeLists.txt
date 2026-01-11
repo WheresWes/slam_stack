@@ -281,6 +281,22 @@ if(BUILD_EXAMPLES)
         slam_engine
     )
 
+    # Relocalization test (coarse-to-fine ICP with real data)
+    add_executable(test_relocalization
+        examples/test_relocalization.cpp
+    )
+    target_link_libraries(test_relocalization
+        slam_engine
+    )
+
+    # Global relocalization test (exhaustive search for large environments)
+    add_executable(test_global_relocalization
+        examples/test_global_relocalization.cpp
+    )
+    target_link_libraries(test_global_relocalization
+        slam_engine
+    )
+
     # Livox Mid-360 connection test
     add_executable(test_livox_connection
         examples/test_livox_connection.cpp

@@ -305,6 +305,14 @@ if(BUILD_EXAMPLES)
         slam_engine
     )
 
+    # Progressive localization test (coverage-based, uses FAST-LIO for accumulation)
+    add_executable(test_progressive_localization
+        examples/test_progressive_localization.cpp
+    )
+    target_link_libraries(test_progressive_localization
+        slam_engine
+    )
+
     # Livox Mid-360 connection test
     add_executable(test_livox_connection
         examples/test_livox_connection.cpp

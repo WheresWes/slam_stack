@@ -36,6 +36,7 @@
 #include "slam/imu_processing.hpp"
 #include "slam/ply_export.hpp"
 #include "slam/icp.hpp"
+#include "slam/progressive_localizer.hpp"
 
 // PCL I/O for map loading
 #include <pcl/io/pcd_io.h>
@@ -331,6 +332,97 @@ public:
     double getLocalizationFitness() const { return localization_fitness_; }
 
     //=========================================================================
+    // Progressive Localization (coverage-based, not time-based)
+    //=========================================================================
+
+    /**
+     * @brief Start progressive localization process
+     *
+     * This begins accumulating geometry for global localization.
+     * Call feedLocalizationScan() with each incoming scan.
+     * The system will automatically attempt localization when enough
+     * coverage is achieved (based on voxel count and rotation, not time).
+     *
+     * @param config Optional configuration for the localizer
+     */
+    void startProgressiveLocalization(const ProgressiveLocalizerConfig& config = ProgressiveLocalizerConfig());
+
+    /**
+     * @brief Feed a scan to the progressive localizer
+     *
+     * @param scan_points Points in sensor frame (body frame)
+     * @param gyro_z_rad Average yaw rate during this scan (from IMU)
+     * @param dt Scan duration in seconds
+     * @return Current localization result with status and guidance
+     */
+    LocalizationResult feedLocalizationScan(const std::vector<V3D>& scan_points,
+                                            double gyro_z_rad = 0.0,
+                                            double dt = 0.1);
+
+    /**
+     * @brief Feed a scan with full IMU motion tracking
+     *
+     * @param scan_points Points in sensor frame
+     * @param delta_rotation Rotation since last scan
+     * @param delta_translation Translation since last scan
+     * @return Current localization result
+     */
+    LocalizationResult feedLocalizationScanWithMotion(const std::vector<V3D>& scan_points,
+                                                       const M3D& delta_rotation,
+                                                       const V3D& delta_translation);
+
+    /**
+     * @brief Get current progressive localization status
+     */
+    LocalizationStatus getProgressiveLocalizationStatus() const;
+
+    /**
+     * @brief Check if progressive localization is complete
+     */
+    bool isProgressiveLocalizationComplete() const;
+
+    /**
+     * @brief Get the progressive localizer for direct access
+     */
+    const ProgressiveGlobalLocalizer& getProgressiveLocalizer() const { return progressive_localizer_; }
+
+    /**
+     * @brief Load pre-built map into memory for progressive localization
+     *
+     * Unlike loadMap(), this does NOT replace the ikd-tree.
+     * Instead, the map is stored for later use during global localization.
+     * FAST-LIO continues building its own local map.
+     *
+     * @param filename Path to PLY or PCD file
+     * @return true if map loaded successfully
+     */
+    bool loadPrebuiltMap(const std::string& filename);
+
+    /**
+     * @brief Swap current ikd-tree with pre-built map and apply transform
+     *
+     * Call this after progressive localization succeeds to:
+     * 1. Replace the local map with the pre-built map
+     * 2. Apply the discovered transform to current state
+     * 3. Enable localization mode
+     *
+     * @param transform Transform from local frame to pre-built map frame
+     */
+    void swapToPrebuiltMap(const M4D& transform);
+
+    /**
+     * @brief Check progressive localization status and attempt if ready
+     *
+     * Call this after each SLAM cycle. The method will:
+     * 1. Monitor coverage of FAST-LIO's local map
+     * 2. Attempt global localization when coverage is sufficient
+     * 3. Automatically swap to pre-built map on success
+     *
+     * @return Current localization result with status and guidance
+     */
+    LocalizationResult checkProgressiveLocalization();
+
+    //=========================================================================
     // Callbacks
     //=========================================================================
 
@@ -469,6 +561,14 @@ private:
     double localization_fitness_ = 0.0;
     ICP icp_;
     MultiScaleICP multi_scale_icp_;
+
+    //=========================================================================
+    // Progressive Localization
+    //=========================================================================
+    ProgressiveGlobalLocalizer progressive_localizer_;
+    bool progressive_localization_active_ = false;
+    PointVector prebuilt_map_points_;  // Stored pre-built map (uses Eigen allocator)
+    bool prebuilt_map_loaded_ = false;
 };
 
 //=============================================================================
@@ -1496,6 +1596,183 @@ inline bool SlamEngine::globalRelocalize(const M4D& initial_guess) {
 
 // Static member definition
 inline SlamEngine* SlamEngine::s_instance_ = nullptr;
+
+//=============================================================================
+// Progressive Localization Implementation (FAST-LIO based)
+//=============================================================================
+
+inline bool SlamEngine::loadPrebuiltMap(const std::string& filename) {
+    std::cout << "[SlamEngine] Loading pre-built map for localization: " << filename << std::endl;
+
+    pcl::PointCloud<PointType>::Ptr map_cloud(new pcl::PointCloud<PointType>());
+
+    // Determine file type and load
+    std::string ext = filename.substr(filename.find_last_of(".") + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    int result = -1;
+    if (ext == "pcd") {
+        result = pcl::io::loadPCDFile<PointType>(filename, *map_cloud);
+    } else if (ext == "ply") {
+        result = pcl::io::loadPLYFile<PointType>(filename, *map_cloud);
+    } else {
+        std::cerr << "[SlamEngine] Unsupported map format: " << ext << std::endl;
+        return false;
+    }
+
+    if (result < 0 || map_cloud->empty()) {
+        std::cerr << "[SlamEngine] Failed to load map or map is empty" << std::endl;
+        return false;
+    }
+
+    // Store the pre-built map (don't load into ikd-tree yet)
+    prebuilt_map_points_ = map_cloud->points;
+    prebuilt_map_loaded_ = true;
+
+    std::cout << "[SlamEngine] Pre-built map loaded: " << prebuilt_map_points_.size()
+              << " points (stored in memory)" << std::endl;
+
+    return true;
+}
+
+inline void SlamEngine::startProgressiveLocalization(const ProgressiveLocalizerConfig& config) {
+    if (!prebuilt_map_loaded_) {
+        std::cerr << "[SlamEngine] Cannot start progressive localization: "
+                  << "call loadPrebuiltMap() first" << std::endl;
+        return;
+    }
+
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "  PROGRESSIVE LOCALIZATION STARTED" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "Pre-built map: " << prebuilt_map_points_.size() << " points" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Instructions:" << std::endl;
+    std::cout << "  1. Hold LiDAR steady for IMU calibration (~2 sec)" << std::endl;
+    std::cout << "  2. Slowly rotate/move LiDAR to scan environment" << std::endl;
+    std::cout << "  3. System will auto-localize when coverage is sufficient" << std::endl;
+    std::cout << "========================================\n" << std::endl;
+
+    // Convert pre-built map points to WorldPoint for the localizer
+    std::vector<WorldPoint> map_world;
+    map_world.reserve(prebuilt_map_points_.size());
+    for (const auto& pt : prebuilt_map_points_) {
+        map_world.emplace_back(pt.x, pt.y, pt.z, pt.intensity);
+    }
+
+    // Configure and reset the progressive localizer
+    progressive_localizer_ = ProgressiveGlobalLocalizer(config);
+    progressive_localizer_.setPrebuiltMap(map_world);
+    progressive_localizer_.reset();
+    progressive_localization_active_ = true;
+}
+
+inline void SlamEngine::swapToPrebuiltMap(const M4D& transform) {
+    if (!prebuilt_map_loaded_) {
+        std::cerr << "[SlamEngine] Cannot swap: no pre-built map loaded" << std::endl;
+        return;
+    }
+
+    std::cout << "[SlamEngine] Swapping to pre-built map..." << std::endl;
+
+    // Get current pose and apply transform
+    M4D current_pose = getPose();
+    M4D world_pose = transform * current_pose;
+
+    // Rebuild ikd-tree with pre-built map
+    ikdtree_.~KD_TREE();
+    new (&ikdtree_) KD_TREE<PointType>();
+    ikdtree_.set_downsample_param(config_.filter_size_map);
+    ikdtree_.Build(prebuilt_map_points_);
+
+    // Update state with transformed pose
+    setInitialPose(world_pose);
+
+    // Enable localization mode
+    setLocalizationMode(true);
+
+    localmap_initialized_ = true;
+
+    std::cout << "[SlamEngine] Map swapped successfully" << std::endl;
+    std::cout << "  ikd-tree size: " << ikdtree_.validnum() << " points" << std::endl;
+    std::cout << "  Localization mode: ENABLED" << std::endl;
+}
+
+inline LocalizationResult SlamEngine::checkProgressiveLocalization() {
+    LocalizationResult result;
+
+    if (!progressive_localization_active_) {
+        result.status = LocalizationStatus::NOT_STARTED;
+        result.message = "Progressive localization not started";
+        return result;
+    }
+
+    // Get current FAST-LIO state
+    auto local_map = getMapPoints();
+    auto trajectory = getTrajectory();
+    M4D current_pose = getPose();
+
+    // Check coverage and attempt localization
+    result = progressive_localizer_.checkAndLocalize(local_map, trajectory, current_pose);
+
+    // If localization succeeded, swap to pre-built map
+    if (result.status == LocalizationStatus::SUCCESS) {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "  LOCALIZATION SUCCESSFUL!" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "Confidence: " << (result.confidence * 100) << "%" << std::endl;
+        std::cout << "Voxels: " << result.local_map_voxels << std::endl;
+        std::cout << "Rotation: " << result.rotation_deg << " deg" << std::endl;
+        std::cout << "Distance: " << result.distance_m << " m" << std::endl;
+        std::cout << "Attempts: " << result.attempt_number << std::endl;
+        std::cout << std::endl;
+
+        // Swap to pre-built map
+        swapToPrebuiltMap(result.transform);
+
+        localization_fitness_ = result.confidence;
+        progressive_localization_active_ = false;
+
+        std::cout << "========================================" << std::endl;
+        std::cout << "  NOW TRACKING IN LOCALIZATION MODE" << std::endl;
+        std::cout << "========================================\n" << std::endl;
+    }
+
+    return result;
+}
+
+inline LocalizationResult SlamEngine::feedLocalizationScan(const std::vector<V3D>& scan_points,
+                                                            double gyro_z_rad,
+                                                            double dt) {
+    // This method is deprecated - use checkProgressiveLocalization() instead
+    // Keeping for backward compatibility
+    (void)scan_points;
+    (void)gyro_z_rad;
+    (void)dt;
+    return checkProgressiveLocalization();
+}
+
+inline LocalizationResult SlamEngine::feedLocalizationScanWithMotion(const std::vector<V3D>& scan_points,
+                                                                       const M3D& delta_rotation,
+                                                                       const V3D& delta_translation) {
+    // This method is deprecated - use checkProgressiveLocalization() instead
+    (void)scan_points;
+    (void)delta_rotation;
+    (void)delta_translation;
+    return checkProgressiveLocalization();
+}
+
+inline LocalizationStatus SlamEngine::getProgressiveLocalizationStatus() const {
+    if (!progressive_localization_active_) {
+        return LocalizationStatus::NOT_STARTED;
+    }
+    return progressive_localizer_.getStatus();
+}
+
+inline bool SlamEngine::isProgressiveLocalizationComplete() const {
+    auto status = progressive_localizer_.getStatus();
+    return status == LocalizationStatus::SUCCESS || status == LocalizationStatus::FAILED;
+}
 
 } // namespace slam
 

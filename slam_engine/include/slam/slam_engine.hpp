@@ -1410,30 +1410,86 @@ inline bool SlamEngine::globalRelocalize(const M4D& initial_guess) {
         scan_points.emplace_back(pt.x, pt.y, pt.z);
     }
 
+    // Extract map points from ikd-tree
+    PointVector map_storage;
+    ikdtree_.flatten(ikdtree_.Root_Node, map_storage, NOT_RECORD);
+    std::vector<V3D> map_points;
+    map_points.reserve(map_storage.size());
+    for (const auto& pt : map_storage) {
+        map_points.emplace_back(pt.x, pt.y, pt.z);
+    }
+
+    std::cout << "  Scan points: " << scan_points.size() << std::endl;
+    std::cout << "  Map points: " << map_points.size() << std::endl;
+
     // Use current pose if no initial guess provided
     M4D guess = initial_guess;
     if (guess.isIdentity()) {
         guess = getPose();
     }
 
-    // Run multi-scale ICP
-    ICPResult result = multi_scale_icp_.align(scan_points, ikdtree_, guess, {2.0, 1.0, 0.5});
+    // Coarse-to-fine ICP alignment
+    M4D current_pose = guess;
 
-    localization_fitness_ = result.fitness_score;
+    // Stage 1: Coarse ICP (0.5m voxels, 3m correspondence)
+    {
+        auto scan_down = voxelDownsample(scan_points, 0.5);
+        auto map_down = voxelDownsample(map_points, 0.5);
 
-    std::cout << "  Iterations: " << result.num_iterations << std::endl;
-    std::cout << "  Inliers: " << result.num_inliers << "/" << scan_points.size() << std::endl;
-    std::cout << "  Fitness: " << result.fitness_score << std::endl;
-    std::cout << "  RMSE: " << result.rmse << std::endl;
-    std::cout << "  Converged: " << (result.converged ? "yes" : "no") << std::endl;
+        ICPConfig cfg;
+        cfg.max_iterations = 20;
+        cfg.max_correspondence_dist = 3.0;
+        cfg.convergence_threshold = 1e-4;
 
-    if (result.converged && result.fitness_score > 0.3) {
+        ICP icp(cfg);
+        auto result = icp.align(scan_down, map_down, current_pose);
+        current_pose = result.transformation;
+        std::cout << "  Coarse: fitness=" << result.fitness_score << std::endl;
+    }
+
+    // Stage 2: Medium ICP (0.2m voxels, 1m correspondence)
+    {
+        auto scan_down = voxelDownsample(scan_points, 0.2);
+        auto map_down = voxelDownsample(map_points, 0.2);
+
+        ICPConfig cfg;
+        cfg.max_iterations = 30;
+        cfg.max_correspondence_dist = 1.0;
+        cfg.convergence_threshold = 1e-5;
+
+        ICP icp(cfg);
+        auto result = icp.align(scan_down, map_down, current_pose);
+        current_pose = result.transformation;
+        std::cout << "  Medium: fitness=" << result.fitness_score << std::endl;
+    }
+
+    // Stage 3: Fine ICP (0.1m voxels, 0.5m correspondence)
+    ICPResult final_result;
+    {
+        auto scan_down = voxelDownsample(scan_points, 0.1);
+        auto map_down = voxelDownsample(map_points, 0.1);
+
+        ICPConfig cfg;
+        cfg.max_iterations = 50;
+        cfg.max_correspondence_dist = 0.5;
+        cfg.convergence_threshold = 1e-6;
+
+        ICP icp(cfg);
+        final_result = icp.align(scan_down, map_down, current_pose);
+        std::cout << "  Fine: fitness=" << final_result.fitness_score
+                  << " rmse=" << final_result.rmse << std::endl;
+    }
+
+    localization_fitness_ = final_result.fitness_score;
+
+    if (final_result.fitness_score > 0.3) {
         // Update pose with ICP result
-        setInitialPose(result.transformation);
+        setInitialPose(final_result.transformation);
         std::cout << "[SlamEngine] Re-localization SUCCESSFUL" << std::endl;
         return true;
     } else {
-        std::cerr << "[SlamEngine] Re-localization FAILED (poor fitness)" << std::endl;
+        std::cerr << "[SlamEngine] Re-localization FAILED (fitness="
+                  << final_result.fitness_score << ")" << std::endl;
         return false;
     }
 }

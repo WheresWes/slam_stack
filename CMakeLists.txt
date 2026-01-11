@@ -100,7 +100,7 @@ if(BUILD_WITH_RERUN)
 endif()
 
 # PCL (optional, for point cloud processing and ikd-tree)
-find_package(PCL 1.8 QUIET COMPONENTS common filters)
+find_package(PCL 1.8 QUIET COMPONENTS common filters io)
 if(PCL_FOUND)
     message(STATUS "Found PCL: ${PCL_VERSION}")
     include_directories(${PCL_INCLUDE_DIRS})
@@ -294,6 +294,14 @@ if(BUILD_EXAMPLES)
         examples/test_global_relocalization.cpp
     )
     target_link_libraries(test_global_relocalization
+        slam_engine
+    )
+
+    # Localization mode test (FAST-LIO with pre-built map)
+    add_executable(test_localization_mode
+        examples/test_localization_mode.cpp
+    )
+    target_link_libraries(test_localization_mode
         slam_engine
     )
 

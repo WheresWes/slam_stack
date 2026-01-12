@@ -359,6 +359,19 @@ if(BUILD_EXAMPLES)
         ${EIGEN3_INCLUDE_DIR}
     )
 
+    # Jitter analyzer (measure position/orientation stability)
+    add_executable(analyze_jitter
+        tools/analyze_jitter.cpp
+    )
+    target_link_libraries(analyze_jitter
+        slam_engine
+    )
+
+    # PLY tiling tool (for performance testing)
+    add_executable(tile_ply
+        tools/tile_ply.cpp
+    )
+
     # Simple SLAM test (no visualization)
     add_executable(test_replay_simple
         examples/test_replay_simple.cpp
@@ -419,6 +432,47 @@ if(HAS_IMGUI AND WIN32)
         WIN32_LEAN_AND_MEAN
     )
     message(STATUS "Building SLAM Control GUI")
+endif()
+
+#==============================================================================
+# SLAM Visualization Library (D3D11 Hardware Accelerated)
+#==============================================================================
+
+if(WIN32)
+    add_library(slam_viewer STATIC
+        visualization/slam_viewer.cpp
+    )
+    target_include_directories(slam_viewer PUBLIC
+        ${PROJECT_SOURCE_DIR}/visualization
+        ${EIGEN3_INCLUDE_DIR}
+    )
+    target_link_libraries(slam_viewer PUBLIC
+        d3d11
+        d3dcompiler
+        dxgi
+    )
+    if(HAS_IMGUI)
+        target_link_libraries(slam_viewer PUBLIC imgui::imgui)
+        target_compile_definitions(slam_viewer PUBLIC HAS_IMGUI)
+    endif()
+    target_compile_definitions(slam_viewer PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+    message(STATUS "Building SLAM Visualization Library")
+
+    # Visualization test application
+    add_executable(test_slam_viewer
+        examples/test_slam_viewer.cpp
+    )
+    target_link_libraries(test_slam_viewer
+        slam_viewer
+        slam_engine
+    )
+    target_compile_definitions(test_slam_viewer PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
 endif()
 
 #==============================================================================

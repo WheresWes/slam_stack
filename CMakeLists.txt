@@ -153,6 +153,14 @@ if(HAS_PCL)
         ${PROJECT_SOURCE_DIR}/slam_engine/include/slam/ikd-Tree/ikd_Tree.cpp
     )
 
+    # VESC CAN driver and motion control sources
+    list(APPEND SLAM_ENGINE_SRC
+        ${PROJECT_SOURCE_DIR}/slam_engine/src/vesc_can_interface.cpp
+        ${PROJECT_SOURCE_DIR}/slam_engine/src/vesc_driver.cpp
+        ${PROJECT_SOURCE_DIR}/slam_engine/src/motion_controller.cpp
+        ${PROJECT_SOURCE_DIR}/slam_engine/src/sensor_fusion.cpp
+    )
+
     # Visualization source (separated for faster incremental builds)
     if(HAS_RERUN)
         list(APPEND SLAM_ENGINE_SRC
@@ -349,6 +357,62 @@ if(BUILD_EXAMPLES)
     if(HAS_RERUN)
         target_link_libraries(replay_slam rerun_sdk)
         target_compile_definitions(replay_slam PRIVATE HAS_RERUN)
+    endif()
+
+    # Combined Calibration + Localization Run
+    add_executable(calibration_run
+        examples/calibration_run.cpp
+    )
+    target_link_libraries(calibration_run
+        slam_engine
+    )
+    if(WIN32)
+        target_link_libraries(calibration_run ws2_32)
+    endif()
+    if(HAS_RERUN)
+        target_link_libraries(calibration_run rerun_sdk)
+        target_compile_definitions(calibration_run PRIVATE HAS_RERUN)
+    endif()
+
+    # Motion Controller Test (sequence with calibration)
+    add_executable(test_motion_sequence
+        examples/test_motion_sequence.cpp
+    )
+    target_link_libraries(test_motion_sequence
+        slam_engine
+    )
+    if(WIN32)
+        target_link_libraries(test_motion_sequence ws2_32)
+    endif()
+
+    # Wheel Odometry vs SLAM Comparison Test
+    add_executable(test_odom_vs_slam
+        examples/test_odom_vs_slam.cpp
+    )
+    target_link_libraries(test_odom_vs_slam
+        slam_engine
+    )
+    if(WIN32)
+        target_link_libraries(test_odom_vs_slam ws2_32)
+    endif()
+    if(HAS_RERUN)
+        target_link_libraries(test_odom_vs_slam rerun_sdk)
+        target_compile_definitions(test_odom_vs_slam PRIVATE HAS_RERUN)
+    endif()
+
+    # Sensor Fusion Test (wheel odom + SLAM fusion)
+    add_executable(test_sensor_fusion
+        examples/test_sensor_fusion.cpp
+    )
+    target_link_libraries(test_sensor_fusion
+        slam_engine
+    )
+    if(WIN32)
+        target_link_libraries(test_sensor_fusion ws2_32)
+    endif()
+    if(HAS_RERUN)
+        target_link_libraries(test_sensor_fusion rerun_sdk)
+        target_compile_definitions(test_sensor_fusion PRIVATE HAS_RERUN)
     endif()
 
     # Recording analyzer (diagnose tracking issues)

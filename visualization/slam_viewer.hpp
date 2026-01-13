@@ -194,6 +194,32 @@ public:
     void appendPointCloud(const PointData* points, size_t count);
 
     /**
+     * Update overlay point cloud (for showing local map during localization)
+     * Rendered with a different color tint to distinguish from main cloud
+     * @param points Array of point data
+     * @param count Number of points
+     */
+    void updateOverlayPointCloud(const PointData* points, size_t count);
+
+    /**
+     * Set overlay point cloud color tint (default: green)
+     * @param r, g, b Color components (0-1)
+     */
+    void setOverlayColorTint(float r, float g, float b);
+
+    /**
+     * Clear overlay point cloud
+     */
+    void clearOverlayPointCloud();
+
+    /**
+     * Set robot position for visualization (draws a triangle marker)
+     * @param x, y Robot position in world frame
+     * @param heading Robot heading in radians
+     */
+    void setRobotPose(float x, float y, float heading);
+
+    /**
      * Update LiDAR pose (triggers coverage painting in localization mode)
      * @param pose 4x4 transform matrix (column-major)
      * @param timestamp_ns Timestamp in nanoseconds
@@ -252,6 +278,13 @@ public:
      * @param height Widget height (0 = auto)
      */
     void renderWidget(float width = 0, float height = 0);
+
+    /**
+     * Get the rendered texture as ImTextureID for ImGui::Image()
+     * Only valid after renderWidget() has been called
+     * @return ImTextureID (actually ID3D11ShaderResourceView*)
+     */
+    void* getImGuiTexture() const;
 
     /**
      * Render to standalone window (if initialized with initStandalone)

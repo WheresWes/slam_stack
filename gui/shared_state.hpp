@@ -68,13 +68,44 @@ struct CalibrationProgress {
     bool success = false;
 };
 
-// Relocalization progress
+// Relocalization progress (with progressive localization support)
 struct RelocalizationProgress {
     bool running = false;
     float progress = 0.0f;
     float confidence = 0.0f;
     std::string status_text;
     bool success = false;
+
+    // Progressive localization coverage metrics
+    bool accumulating = false;      // True while building local map
+    int local_map_voxels = 0;       // Voxels in local FAST-LIO map
+    int local_map_points = 0;       // Points in local map
+    float rotation_deg = 0.0f;      // Total rotation from start
+    float distance_m = 0.0f;        // Total distance traveled
+    int attempt_number = 0;         // Current attempt count
+
+    // Thresholds for UI feedback
+    static constexpr int MIN_VOXELS = 400;
+    static constexpr int GOOD_VOXELS = 800;
+    static constexpr int IDEAL_VOXELS = 1200;
+    static constexpr float MIN_ROTATION = 45.0f;   // degrees
+    static constexpr float GOOD_ROTATION = 90.0f;  // degrees
+
+    // Check if ready to attempt
+    bool isReadyToAttempt() const {
+        if (local_map_voxels >= IDEAL_VOXELS) return true;
+        if (local_map_voxels >= GOOD_VOXELS && rotation_deg >= MIN_ROTATION) return true;
+        if (local_map_voxels >= MIN_VOXELS && rotation_deg >= GOOD_ROTATION) return true;
+        return false;
+    }
+
+    // Get coverage quality description
+    const char* getCoverageQuality() const {
+        if (local_map_voxels >= IDEAL_VOXELS) return "Excellent";
+        if (local_map_voxels >= GOOD_VOXELS) return "Good";
+        if (local_map_voxels >= MIN_VOXELS) return "Minimal";
+        return "Insufficient";
+    }
 };
 
 // PAUT probe configuration

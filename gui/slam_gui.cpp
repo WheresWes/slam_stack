@@ -56,6 +56,9 @@
 #include "slam/motion_controller.hpp"
 #endif
 
+// GPU-accelerated viewer
+#include "slam_viewer.hpp"
+
 #pragma comment(lib, "d3d11.lib")
 
 // Gamepad support via SDL2 (supports PS5 DualSense, Xbox, etc.)
@@ -79,6 +82,11 @@ static IDXGISwapChain*          g_pSwapChain = nullptr;
 static bool                     g_SwapChainOccluded = false;
 static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
 static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
+
+// GPU-accelerated map viewers
+static std::unique_ptr<slam::viz::SlamViewer> g_mapping_viewer;    // For Mapping tab
+static std::unique_ptr<slam::viz::SlamViewer> g_localization_viewer;  // For Localization tab
+static bool g_viewers_initialized = false;
 
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
@@ -131,6 +139,15 @@ struct AppConfig {
     float camera_distance = 5.0f;
     float camera_pitch = 30.0f;
     float camera_yaw = 0.0f;
+
+    // Viewer settings (SlamViewer)
+    float viewer_point_size = 3.0f;
+    int viewer_colormap = 1;  // 0=Grayscale, 1=TURBO, 2=Viridis, 3=Height
+    bool viewer_enable_lod = false;   // Disabled by default to show all points
+    float viewer_lod_distance = 20.0f;
+    int viewer_max_points = 5000000;  // Max visible points
+    float viewer_min_zoom = 0.5f;     // Minimum camera distance (close zoom)
+    float viewer_max_zoom = 500.0f;   // Maximum camera distance (far zoom)
 };
 
 //==============================================================================
@@ -144,6 +161,13 @@ static HullCoverage g_hull;
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_e_stop{false};
 static std::thread g_worker_thread;
+static std::thread g_control_thread;  // High-priority motor control thread
+static HWND g_hwnd = nullptr;  // Main window handle for focus checking
+
+// Atomic velocity state for control thread (bypasses command queue latency)
+static std::atomic<float> g_target_linear{0.0f};
+static std::atomic<float> g_target_angular{0.0f};
+static std::atomic<bool> g_can_drive{false};
 
 // Hardware drivers
 static std::atomic<bool> g_hardware_initialized{false};
@@ -217,6 +241,109 @@ void SetTooltip(const char* desc) {
 }
 
 //==============================================================================
+// Helper: Settings persistence
+//==============================================================================
+static const char* SETTINGS_FILE = "slam_gui_settings.ini";
+
+bool SaveSettings() {
+    std::ofstream f(SETTINGS_FILE);
+    if (!f) return false;
+
+    f << "[Connection]\n";
+    f << "lidar_ip=" << g_config.lidar_ip << "\n";
+    f << "host_ip=" << g_config.host_ip << "\n";
+    f << "can_port=" << g_config.can_port << "\n";
+    f << "vesc_left_id=" << g_config.vesc_left_id << "\n";
+    f << "vesc_right_id=" << g_config.vesc_right_id << "\n";
+
+    f << "\n[SLAM]\n";
+    f << "voxel_size=" << g_config.voxel_size << "\n";
+    f << "blind_distance=" << g_config.blind_distance << "\n";
+    f << "max_iterations=" << g_config.max_iterations << "\n";
+    f << "gyr_cov=" << g_config.gyr_cov << "\n";
+    f << "deskew_enabled=" << (g_config.deskew_enabled ? 1 : 0) << "\n";
+    f << "point_filter=" << g_config.point_filter << "\n";
+
+    f << "\n[Fusion]\n";
+    f << "slam_alpha_pos=" << g_config.slam_alpha_pos << "\n";
+    f << "slam_alpha_hdg=" << g_config.slam_alpha_hdg << "\n";
+    f << "straight_correction=" << g_config.straight_correction << "\n";
+    f << "turning_correction=" << g_config.turning_correction << "\n";
+
+    f << "\n[Motion]\n";
+    f << "max_duty=" << g_config.max_duty << "\n";
+    f << "ramp_rate=" << g_config.ramp_rate << "\n";
+    f << "max_speed=" << g_config.max_speed << "\n";
+
+    f << "\n[Viewer]\n";
+    f << "point_size=" << g_config.viewer_point_size << "\n";
+    f << "colormap=" << g_config.viewer_colormap << "\n";
+    f << "enable_lod=" << (g_config.viewer_enable_lod ? 1 : 0) << "\n";
+    f << "lod_distance=" << g_config.viewer_lod_distance << "\n";
+    f << "max_points=" << g_config.viewer_max_points << "\n";
+    f << "min_zoom=" << g_config.viewer_min_zoom << "\n";
+    f << "max_zoom=" << g_config.viewer_max_zoom << "\n";
+
+    f << "\n[Paths]\n";
+    f << "calibration_file=" << g_config.calibration_file << "\n";
+    f << "map_directory=" << g_config.map_directory << "\n";
+
+    return true;
+}
+
+bool LoadSettings() {
+    std::ifstream f(SETTINGS_FILE);
+    if (!f) return false;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        // Skip comments and section headers
+        if (line.empty() || line[0] == '#' || line[0] == '[') continue;
+
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = line.substr(0, eq);
+        std::string value = line.substr(eq + 1);
+
+        // Connection
+        if (key == "lidar_ip") strncpy(g_config.lidar_ip, value.c_str(), sizeof(g_config.lidar_ip) - 1);
+        else if (key == "host_ip") strncpy(g_config.host_ip, value.c_str(), sizeof(g_config.host_ip) - 1);
+        else if (key == "can_port") strncpy(g_config.can_port, value.c_str(), sizeof(g_config.can_port) - 1);
+        else if (key == "vesc_left_id") g_config.vesc_left_id = std::stoi(value);
+        else if (key == "vesc_right_id") g_config.vesc_right_id = std::stoi(value);
+        // SLAM
+        else if (key == "voxel_size") g_config.voxel_size = std::stof(value);
+        else if (key == "blind_distance") g_config.blind_distance = std::stof(value);
+        else if (key == "max_iterations") g_config.max_iterations = std::stoi(value);
+        else if (key == "gyr_cov") g_config.gyr_cov = std::stof(value);
+        else if (key == "deskew_enabled") g_config.deskew_enabled = (std::stoi(value) != 0);
+        else if (key == "point_filter") g_config.point_filter = std::stoi(value);
+        // Fusion
+        else if (key == "slam_alpha_pos") g_config.slam_alpha_pos = std::stof(value);
+        else if (key == "slam_alpha_hdg") g_config.slam_alpha_hdg = std::stof(value);
+        else if (key == "straight_correction") g_config.straight_correction = std::stof(value);
+        else if (key == "turning_correction") g_config.turning_correction = std::stof(value);
+        // Motion
+        else if (key == "max_duty") g_config.max_duty = std::stof(value);
+        else if (key == "ramp_rate") g_config.ramp_rate = std::stof(value);
+        else if (key == "max_speed") g_config.max_speed = std::stof(value);
+        // Viewer
+        else if (key == "point_size") g_config.viewer_point_size = std::stof(value);
+        else if (key == "colormap") g_config.viewer_colormap = std::stoi(value);
+        else if (key == "enable_lod") g_config.viewer_enable_lod = (std::stoi(value) != 0);
+        else if (key == "lod_distance") g_config.viewer_lod_distance = std::stof(value);
+        else if (key == "max_points") g_config.viewer_max_points = std::stoi(value);
+        else if (key == "min_zoom") g_config.viewer_min_zoom = std::stof(value);
+        else if (key == "max_zoom") g_config.viewer_max_zoom = std::stof(value);
+        // Paths
+        else if (key == "calibration_file") strncpy(g_config.calibration_file, value.c_str(), sizeof(g_config.calibration_file) - 1);
+        else if (key == "map_directory") strncpy(g_config.map_directory, value.c_str(), sizeof(g_config.map_directory) - 1);
+    }
+    return true;
+}
+
+//==============================================================================
 // Helper: Scan for PLY files
 //==============================================================================
 void ScanForMaps() {
@@ -240,6 +367,22 @@ void UpdateGamepad() {
 
     // Poll SDL events and update gamepad state
     g_gamepad->update();
+
+    // Try to reconnect if disconnected (check every ~2 seconds)
+    static auto last_reconnect_attempt = std::chrono::steady_clock::now();
+    if (!g_gamepad->isConnected()) {
+        auto now = std::chrono::steady_clock::now();
+        float elapsed = std::chrono::duration<float>(now - last_reconnect_attempt).count();
+        if (elapsed >= 2.0f) {
+            last_reconnect_attempt = now;
+            // Try to re-initialize (will scan for new controllers)
+            if (g_gamepad->init()) {
+                g_shared.setStatusMessage("Gamepad reconnected: " + g_gamepad->getControllerName());
+                g_gamepad->setLEDColor(255, 255, 255);
+                g_gamepad->rumble(0.3f, 0.3f, 200);
+            }
+        }
+    }
 
     if (g_gamepad->isConnected()) {
         g_gamepad_connected = true;
@@ -280,22 +423,42 @@ void UpdateGamepad() {
         }
         prev_estop = estop_pressed;
 
-        // Update LED color based on motion and state
-        if (!g_e_stop.load()) {
+        // Update LED color based on state (user-requested scheme)
+        // Blue = connected/idle, Green = scanning modes, Red = E-STOP, Orange flash = error
+        if (g_e_stop.load()) {
+            g_gamepad->setLEDColor(255, 0, 0);  // Red = E-STOP active
+        } else {
             AppState app_state = g_shared.getAppState();
-            bool is_moving = (std::abs(g_drive_cmd.linear_velocity) > 0.01f ||
-                             std::abs(g_drive_cmd.angular_velocity) > 0.1f);
+            bool has_error = !g_shared.getErrorMessage().empty();
 
-            if (is_moving) {
-                g_gamepad->setLEDColor(0, 100, 255);  // Blue = moving
-            } else if (app_state == AppState::MAPPING) {
-                g_gamepad->setLEDColor(0, 255, 0);    // Green = mapping
-            } else if (app_state == AppState::LOCALIZED) {
-                g_gamepad->setLEDColor(0, 200, 100);  // Teal = localized
-            } else if (app_state == AppState::OPERATING) {
-                g_gamepad->setLEDColor(100, 200, 255); // Cyan = operating
+            // Check for connection issues
+            bool lidar_ok = (g_shared.getLidarStatus().connection == ConnectionStatus::CONNECTED);
+            MotorStatus motor_l = g_shared.getMotorStatus(0);
+            MotorStatus motor_r = g_shared.getMotorStatus(1);
+            bool vesc_ok = motor_l.connected || motor_r.connected;
+            bool connection_issue = !lidar_ok || !vesc_ok;
+
+            if (has_error || connection_issue) {
+                // Orange flashing for errors/connection issues
+                static auto last_flash = std::chrono::steady_clock::now();
+                static bool flash_on = true;
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<float>(now - last_flash).count() > 0.3f) {
+                    flash_on = !flash_on;
+                    last_flash = now;
+                }
+                if (flash_on) {
+                    g_gamepad->setLEDColor(255, 140, 0);  // Orange
+                } else {
+                    g_gamepad->setLEDColor(50, 30, 0);    // Dim orange
+                }
+            } else if (app_state == AppState::MAPPING ||
+                       app_state == AppState::LOCALIZED ||
+                       app_state == AppState::RELOCALIZING ||
+                       app_state == AppState::OPERATING) {
+                g_gamepad->setLEDColor(0, 255, 0);  // Green = scanning/operating modes
             } else {
-                g_gamepad->setLEDColor(255, 255, 255); // White = idle
+                g_gamepad->setLEDColor(0, 100, 255);  // Blue = connected/idle
             }
         }
     } else {
@@ -516,6 +679,23 @@ void UpdateMapPointsForVisualization() {
 
     g_shared.setMapPoints(render_points);
 
+    // Also update GPU viewer with PointData format
+    if (g_viewers_initialized && g_mapping_viewer) {
+        std::vector<slam::viz::PointData> gpu_points;
+        gpu_points.reserve(world_points.size());
+        for (const auto& wp : world_points) {
+            slam::viz::PointData pd;
+            pd.x = wp.x;
+            pd.y = wp.y;
+            pd.z = wp.z;
+            // Map intensity to 0-255, or use height-based intensity
+            pd.intensity = static_cast<uint8_t>(std::clamp(wp.intensity, 0.0f, 255.0f));
+            pd.padding[0] = pd.padding[1] = pd.padding[2] = 0;
+            gpu_points.push_back(pd);
+        }
+        g_mapping_viewer->updatePointCloud(gpu_points.data(), gpu_points.size());
+    }
+
     // Also update current scan (more frequently visible)
     auto scan_points = g_slam->getCurrentScan();
     std::vector<RenderPoint> scan_render;
@@ -535,6 +715,26 @@ void UpdateMapPointsForVisualization() {
     }
 
     g_shared.setCurrentScan(scan_render);
+
+    // During localization, update the localization viewer overlay with the local map
+    // This shows the local map being built (in green) over the pre-built map (in turbo colormap)
+    AppState state = g_shared.getAppState();
+    if (g_viewers_initialized && g_localization_viewer &&
+        (state == AppState::RELOCALIZING || state == AppState::LOCALIZED)) {
+        std::vector<slam::viz::PointData> overlay_points;
+        overlay_points.reserve(world_points.size());
+        for (const auto& wp : world_points) {
+            slam::viz::PointData pd;
+            pd.x = wp.x;
+            pd.y = wp.y;
+            pd.z = wp.z;
+            pd.intensity = static_cast<uint8_t>(std::clamp(wp.intensity, 0.0f, 255.0f));
+            pd.padding[0] = pd.padding[1] = pd.padding[2] = 0;
+            overlay_points.push_back(pd);
+        }
+        g_localization_viewer->updateOverlayPointCloud(overlay_points.data(), overlay_points.size());
+        g_localization_viewer->setOverlayColorTint(0.2f, 1.0f, 0.4f);  // Bright green for local map
+    }
 }
 
 // Helper: Update motor status in shared state
@@ -687,6 +887,68 @@ void ShutdownHardware() {
     g_shared.hardware_connected.store(false);
 }
 
+//==============================================================================
+// High-Priority Motor Control Thread
+// Runs at 50Hz guaranteed, never blocked by SLAM processing
+//==============================================================================
+void ControlThread() {
+    // Set thread priority to highest for real-time motor control
+    // This ensures motor commands are sent consistently even during heavy SLAM processing
+    HANDLE hThread = GetCurrentThread();
+    SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST);
+
+    auto last_update = std::chrono::steady_clock::now();
+
+    while (g_running.load()) {
+        auto now = std::chrono::steady_clock::now();
+        float dt = std::chrono::duration<float>(now - last_update).count();
+        last_update = now;
+
+        // Clamp dt to reasonable range
+        if (dt > 0.1f) dt = 0.02f;
+        if (dt < 0.001f) dt = 0.001f;
+
+        // Handle E-STOP
+        if (g_e_stop.load()) {
+            if (g_motion) {
+                g_motion->emergencyStop();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        // Only control motors when hardware is ready and we can drive
+        if (g_hardware_initialized.load() && g_motion && g_can_drive.load()) {
+            // Read atomic velocity targets
+            float linear = g_target_linear.load();
+            float angular = g_target_angular.load();
+
+            // Send motor commands
+            g_motion->setVelocity(linear, angular);
+            g_motion->update(dt);
+
+            // Update motor status for GUI
+            UpdateMotorStatus();
+        } else if (g_motion) {
+            // Not in drivable state - ensure motors are stopped
+            g_motion->setVelocity(0.0f, 0.0f);
+            g_motion->update(dt);
+        }
+
+        // Precise 50Hz timing (20ms period)
+        auto elapsed = std::chrono::steady_clock::now() - now;
+        auto sleep_time = std::chrono::milliseconds(20) - elapsed;
+        if (sleep_time > std::chrono::milliseconds(0)) {
+            std::this_thread::sleep_for(sleep_time);
+        }
+    }
+
+    // Ensure motors stop on thread exit
+    if (g_motion) {
+        g_motion->stop(true);
+    }
+}
+
 void WorkerThread() {
     g_shared.setAppState(AppState::STARTUP);
     g_shared.setStatusMessage("Initializing hardware...");
@@ -703,8 +965,8 @@ void WorkerThread() {
     g_hardware_initialized.store(true);
 
     auto last_update = std::chrono::steady_clock::now();
-    float target_linear = 0.0f;
-    float target_angular = 0.0f;
+    // Note: Motor velocity targets are now in g_target_linear/g_target_angular atomics
+    // Control is handled by the dedicated high-priority ControlThread
 
     while (g_running.load()) {
         auto now = std::chrono::steady_clock::now();
@@ -786,6 +1048,11 @@ void WorkerThread() {
                     if (g_slam) {
                         g_slam->reset();
                         g_slam->setLocalizationMode(false);
+                        // Apply current settings before mapping starts
+                        g_slam->setVoxelSize(g_config.voxel_size);
+                        g_slam->setGyrCov(g_config.gyr_cov);
+                        g_slam->setDeskewEnabled(g_config.deskew_enabled);
+                        // Note: max_iterations, blind_distance, point_filter require restart
                     }
                     if (g_fusion) {
                         g_fusion->reset();
@@ -796,7 +1063,8 @@ void WorkerThread() {
                     break;
 
                 case CommandType::STOP_MAPPING:
-                    target_linear = target_angular = 0.0f;
+                    g_target_linear.store(0.0f);
+                    g_target_angular.store(0.0f);
                     if (g_motion) g_motion->stop();
                     g_shared.setAppState(AppState::IDLE);
                     g_shared.setStatusMessage("Mapping stopped");
@@ -804,13 +1072,15 @@ void WorkerThread() {
 
                 case CommandType::START_OPERATING:
                     // Drive-only mode (no SLAM processing)
-                    target_linear = target_angular = 0.0f;
+                    g_target_linear.store(0.0f);
+                    g_target_angular.store(0.0f);
                     g_shared.setAppState(AppState::OPERATING);
                     g_shared.setStatusMessage("Operating mode - manual drive only");
                     break;
 
                 case CommandType::STOP_OPERATING:
-                    target_linear = target_angular = 0.0f;
+                    g_target_linear.store(0.0f);
+                    g_target_angular.store(0.0f);
                     if (g_motion) g_motion->stop();
                     g_shared.setAppState(AppState::IDLE);
                     g_shared.setStatusMessage("Operating stopped");
@@ -834,11 +1104,35 @@ void WorkerThread() {
                 case CommandType::LOAD_MAP: {
                     auto* file_cmd = std::get_if<FileCommand>(&cmd->payload);
                     if (file_cmd && g_slam) {
-                        g_shared.setStatusMessage("Loading map...");
-                        if (g_slam->loadMap(file_cmd->path)) {
-                            g_slam->setLocalizationMode(true);
+                        g_shared.setStatusMessage("Loading pre-built map...");
+                        // Use loadPrebuiltMap() - stores in memory, doesn't replace ikd-tree
+                        // This allows FAST-LIO to build a local map for progressive localization
+                        if (g_slam->loadPrebuiltMap(file_cmd->path)) {
                             g_shared.setAppState(AppState::MAP_LOADED);
-                            g_shared.setStatusMessage("Map loaded: " + file_cmd->path);
+                            g_shared.setStatusMessage("Map loaded: " + file_cmd->path + " - Click Relocalize to start");
+
+                            // Update localization viewer with pre-built map
+                            if (g_viewers_initialized && g_localization_viewer) {
+                                auto prebuilt = g_slam->getPrebuiltMapPoints();
+                                std::vector<slam::viz::PointData> gpu_points;
+                                gpu_points.reserve(prebuilt.size());
+                                for (const auto& wp : prebuilt) {
+                                    slam::viz::PointData pd;
+                                    pd.x = wp.x;
+                                    pd.y = wp.y;
+                                    pd.z = wp.z;
+                                    pd.intensity = static_cast<uint8_t>(std::clamp(wp.intensity, 0.0f, 255.0f));
+                                    pd.padding[0] = pd.padding[1] = pd.padding[2] = 0;
+                                    gpu_points.push_back(pd);
+                                }
+                                g_localization_viewer->updatePointCloud(gpu_points.data(), gpu_points.size());
+                                g_localization_viewer->fitCameraToContent();
+                            }
+
+                            // Reset relocalization progress
+                            RelocalizationProgress prog;
+                            prog.status_text = "Map loaded - ready to start localization";
+                            g_shared.setRelocalizationProgress(prog);
                         } else {
                             g_shared.setErrorMessage("Failed to load map");
                         }
@@ -847,70 +1141,59 @@ void WorkerThread() {
                 }
 
                 case CommandType::RELOCALIZE:
-                    if (g_shared.getAppState() == AppState::MAP_LOADED && g_slam) {
+                    if ((g_shared.getAppState() == AppState::MAP_LOADED ||
+                         g_shared.getAppState() == AppState::RELOCALIZE_FAILED) && g_slam) {
+                        // Start progressive localization
+                        // FAST-LIO will build a local map, which we match against the pre-built map
                         g_shared.setAppState(AppState::RELOCALIZING);
-                        g_shared.setStatusMessage("Running coarse-to-fine ICP localization...");
+                        g_shared.setStatusMessage("Starting progressive localization - rotate robot to build geometry...");
 
+                        // Configure progressive localizer
+                        // Coverage thresholds are managed internally by CoverageMonitor
+                        slam::ProgressiveLocalizerConfig loc_config;
+                        loc_config.max_attempts = 5;
+                        loc_config.min_confidence = 0.45;
+                        loc_config.high_confidence = 0.65;
+
+                        // Start progressive localization (FAST-LIO continues building local map)
+                        g_slam->startProgressiveLocalization(loc_config);
+
+                        // Update progress to show accumulating
                         RelocalizationProgress prog;
                         prog.running = true;
+                        prog.accumulating = true;
                         prog.progress = 0.0f;
-                        prog.status_text = "Starting ICP alignment...";
+                        prog.status_text = "Building local map - rotate robot slowly...";
+                        prog.local_map_voxels = 0;
+                        prog.rotation_deg = 0.0f;
+                        prog.attempt_number = 0;
                         g_shared.setRelocalizationProgress(prog);
+                    }
+                    break;
 
-                        // Check we have scan data
-                        auto scan_points = g_slam->getCurrentScan();
-                        if (scan_points.size() < 100) {
-                            g_shared.setAppState(AppState::RELOCALIZE_FAILED);
-                            g_shared.setErrorMessage("Insufficient scan data - wait for LiDAR");
-                            prog.running = false;
-                            prog.success = false;
-                            prog.status_text = "Need more scan data";
-                            g_shared.setRelocalizationProgress(prog);
-                            break;
+                case CommandType::STOP_LOCALIZATION:
+                    if (g_shared.getAppState() == AppState::LOCALIZED ||
+                        g_shared.getAppState() == AppState::RELOCALIZING) {
+                        // Reset to idle state
+                        if (g_slam) {
+                            g_slam->setLocalizationMode(false);
                         }
+                        g_shared.setAppState(AppState::IDLE);
+                        g_shared.setStatusMessage("Localization stopped");
 
-                        // Update progress
-                        prog.status_text = "Running coarse alignment...";
-                        prog.progress = 0.2f;
-                        g_shared.setRelocalizationProgress(prog);
-
-                        // Run the existing coarse-to-fine ICP (3-stage)
-                        // Note: If pose hint was set via SET_POSE_HINT, it's already in g_slam
-                        bool success = g_slam->globalRelocalize();
-
-                        prog.progress = 0.9f;
-                        prog.status_text = "Verifying alignment...";
-                        g_shared.setRelocalizationProgress(prog);
-
-                        // Get fitness score for confidence
-                        double fitness = g_slam->getLocalizationFitness();
-
-                        if (success) {
-                            g_shared.setAppState(AppState::LOCALIZED);
-                            g_shared.setStatusMessage("Localized successfully");
-
-                            prog.running = false;
-                            prog.success = true;
-                            prog.confidence = static_cast<float>(fitness);
-                            prog.status_text = "Aligned (fitness: " + std::to_string(int(fitness * 100)) + "%)";
-                        } else {
-                            g_shared.setAppState(AppState::RELOCALIZE_FAILED);
-                            g_shared.setStatusMessage("Relocalization failed - try different position or pose hint");
-
-                            prog.running = false;
-                            prog.success = false;
-                            prog.confidence = static_cast<float>(fitness);
-                            prog.status_text = "Failed (fitness: " + std::to_string(int(fitness * 100)) + "%)";
-                        }
+                        // Clear progress
+                        RelocalizationProgress prog;
                         g_shared.setRelocalizationProgress(prog);
                     }
                     break;
 
                 case CommandType::SET_VELOCITY: {
+                    // Legacy command - velocity now set directly via atomics from main thread
+                    // Keep handler for any remaining command-based callers
                     auto* vel_cmd = std::get_if<VelocityCommand>(&cmd->payload);
                     if (vel_cmd) {
-                        target_linear = vel_cmd->linear_mps;
-                        target_angular = vel_cmd->angular_radps;
+                        g_target_linear.store(vel_cmd->linear_mps);
+                        g_target_angular.store(vel_cmd->angular_radps);
                     }
                     break;
                 }
@@ -1069,7 +1352,8 @@ void WorkerThread() {
                 }
 
                 case CommandType::CANCEL_CALIBRATION:
-                    target_linear = target_angular = 0.0f;
+                    g_target_linear.store(0.0f);
+                    g_target_angular.store(0.0f);
                     if (g_motion) g_motion->stop();
                     g_shared.setAppState(AppState::IDLE);
                     g_shared.setStatusMessage("Calibration cancelled");
@@ -1083,15 +1367,7 @@ void WorkerThread() {
                     g_shared.setStatusMessage("Map cleared");
                     break;
 
-                case CommandType::STOP_LOCALIZATION:
-                    target_linear = target_angular = 0.0f;
-                    if (g_motion) g_motion->stop();
-                    if (g_slam) {
-                        g_slam->setLocalizationMode(false);
-                    }
-                    g_shared.setAppState(AppState::IDLE);
-                    g_shared.setStatusMessage("Localization stopped");
-                    break;
+                // Note: STOP_LOCALIZATION is handled in the hardware-connected section above
 
                 case CommandType::SET_POSE_HINT: {
                     auto* hint_cmd = std::get_if<PoseHintCommand>(&cmd->payload);
@@ -1174,8 +1450,10 @@ void WorkerThread() {
         }
 
         // 3. Process sensor data
+        // CRITICAL: SLAM must run during RELOCALIZING to build the local map for matching!
         AppState state = g_shared.getAppState();
-        bool do_slam = (state == AppState::MAPPING || state == AppState::LOCALIZED);
+        bool do_slam = (state == AppState::MAPPING || state == AppState::LOCALIZED ||
+                        state == AppState::RELOCALIZING);
 
         if (do_slam && g_slam) {
             // Process IMU data
@@ -1209,6 +1487,86 @@ void WorkerThread() {
 
             // Update map points for 3D visualization (throttled internally)
             UpdateMapPointsForVisualization();
+
+            // Check progressive localization if in RELOCALIZING state
+            if (g_shared.getAppState() == AppState::RELOCALIZING) {
+                // Check localization status
+                slam::LocalizationResult loc_result = g_slam->checkProgressiveLocalization();
+
+                // Update progress in shared state
+                RelocalizationProgress prog = g_shared.getRelocalizationProgress();
+                prog.running = true;
+                prog.local_map_voxels = loc_result.local_map_voxels;
+                prog.local_map_points = loc_result.local_map_points;
+                prog.rotation_deg = static_cast<float>(loc_result.rotation_deg);
+                prog.distance_m = static_cast<float>(loc_result.distance_m);
+                prog.attempt_number = loc_result.attempt_number;
+
+                // Calculate progress based on coverage
+                float voxel_progress = static_cast<float>(loc_result.local_map_voxels) / 800.0f;
+                float rotation_progress = static_cast<float>(loc_result.rotation_deg) / 90.0f;
+                prog.progress = std::min(1.0f, std::max(voxel_progress, rotation_progress));
+
+                // Update status text based on state
+                switch (loc_result.status) {
+                    case slam::LocalizationStatus::ACCUMULATING:
+                        prog.accumulating = true;
+                        prog.status_text = "Building map: " +
+                            std::to_string(loc_result.local_map_voxels) + " voxels, " +
+                            std::to_string(int(loc_result.rotation_deg)) + " deg rotation";
+                        break;
+
+                    case slam::LocalizationStatus::VIEW_SATURATED:
+                        prog.accumulating = true;
+                        prog.status_text = "View saturated - rotate robot for more coverage";
+                        break;
+
+                    case slam::LocalizationStatus::READY_TO_ATTEMPT:
+                    case slam::LocalizationStatus::ATTEMPTING:
+                        prog.accumulating = false;
+                        prog.status_text = "Attempting localization (attempt " +
+                            std::to_string(loc_result.attempt_number) + ")...";
+                        break;
+
+                    case slam::LocalizationStatus::LOW_CONFIDENCE:
+                        prog.accumulating = true;
+                        prog.status_text = "Low confidence - continue rotating robot...";
+                        break;
+
+                    case slam::LocalizationStatus::SUCCESS:
+                        // Localization succeeded!
+                        prog.running = false;
+                        prog.accumulating = false;
+                        prog.success = true;
+                        prog.confidence = static_cast<float>(loc_result.confidence);
+                        prog.status_text = "Localized! (confidence: " +
+                            std::to_string(int(loc_result.confidence * 100)) + "%)";
+
+                        // Swap to pre-built map for continued tracking
+                        g_slam->swapToPrebuiltMap(loc_result.transform);
+
+                        g_shared.setAppState(AppState::LOCALIZED);
+                        g_shared.setStatusMessage("Localization successful - tracking on pre-built map");
+                        break;
+
+                    case slam::LocalizationStatus::FAILED:
+                        // Max attempts reached
+                        prog.running = false;
+                        prog.accumulating = false;
+                        prog.success = false;
+                        prog.status_text = loc_result.message;
+
+                        g_shared.setAppState(AppState::RELOCALIZE_FAILED);
+                        g_shared.setStatusMessage("Localization failed after " +
+                            std::to_string(loc_result.attempt_number) + " attempts - try different position");
+                        break;
+
+                    default:
+                        break;
+                }
+
+                g_shared.setRelocalizationProgress(prog);
+            }
         }
 
         // 4. Update wheel odometry and sensor fusion
@@ -1230,7 +1588,7 @@ void WorkerThread() {
                 slam::Velocity2D vel = g_motion->getVelocity();
                 actual_angular = vel.angular;  // rad/s from wheel differential
             } else {
-                actual_angular = target_angular;  // Fallback to command
+                actual_angular = g_target_angular.load();  // Fallback to command
             }
 
             // Update sensor fusion with actual measured velocities
@@ -1304,24 +1662,16 @@ void WorkerThread() {
             }
         }
 
-        // 5. Update motor status
-        UpdateMotorStatus();
+        // 5. Update g_can_drive for control thread
+        // (Motor status is updated by control thread)
+        bool can_drive = (state == AppState::MAPPING || state == AppState::LOCALIZED ||
+                          state == AppState::OPERATING || state == AppState::RELOCALIZING);
+        g_can_drive.store(can_drive);
 
-        // 6. Apply gamepad input (if connected and in operational state)
-        bool can_drive = (state == AppState::MAPPING || state == AppState::LOCALIZED || state == AppState::OPERATING);
-        if (g_gamepad_connected && can_drive) {
-            // Use pre-computed drive command from getDriveCommand() (matches manual_drive.cpp)
-            target_linear = g_drive_cmd.linear_velocity;
-            target_angular = g_drive_cmd.angular_velocity;
-        }
+        // Note: Motor control has moved to high-priority ControlThread
+        // Velocity targets are set directly by main thread via g_target_linear/angular
 
-        // 7. Send motor commands
-        if (g_motion && can_drive) {
-            g_motion->setVelocity(target_linear, target_angular);
-            g_motion->update(dt);
-        }
-
-        // 8. Update LiDAR status
+        // 6. Update LiDAR status
         if (g_lidar) {
             LidarStatus lidar_status;
             lidar_status.connection = g_lidar->isConnected() ? ConnectionStatus::CONNECTED : ConnectionStatus::DISCONNECTED;
@@ -1569,7 +1919,8 @@ void WorkerThread() {
 
         // 3. Simulation: Update pose based on gamepad input
         AppState state = g_shared.getAppState();
-        bool can_drive = (state == AppState::MAPPING || state == AppState::LOCALIZED || state == AppState::OPERATING);
+        bool can_drive = (state == AppState::MAPPING || state == AppState::LOCALIZED ||
+                          state == AppState::OPERATING || state == AppState::RELOCALIZING);
         if (can_drive) {
             // Use pre-computed drive command from getDriveCommand() (matches manual_drive.cpp)
             float linear = g_drive_cmd.linear_velocity;
@@ -2325,11 +2676,23 @@ void DrawMappingTab() {
     // Split into left (viewer) and right (controls) panels
     float panel_width = 280;
 
-    // Left side - Map viewer
+    // Left side - Map viewer (GPU-accelerated when available)
     ImGui::BeginChild("MappingViewer", ImVec2(-panel_width - 10, 0), true);
     ImGui::Text("Live Map View");
     ImGui::Separator();
-    DrawMapViewer(true, true, true);
+
+    if (g_viewers_initialized && g_mapping_viewer) {
+        // Update robot pose in viewer
+        Pose3D robot_pose = g_shared.getFusedPose();
+        g_mapping_viewer->setRobotPose(robot_pose.x, robot_pose.y, robot_pose.yaw);
+
+        // Use GPU-accelerated viewer
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        g_mapping_viewer->renderWidget(avail.x, avail.y);
+    } else {
+        // Fallback to CPU-based viewer
+        DrawMapViewer(true, true, true);
+    }
     ImGui::EndChild();
 
     ImGui::SameLine();
@@ -2430,11 +2793,23 @@ void DrawLocalizationTab() {
     // Split into left (viewer) and right (controls) panels
     float panel_width = 280;
 
-    // Left side - Map viewer
+    // Left side - Map viewer (GPU-accelerated with dual-map display)
     ImGui::BeginChild("LocalizationViewer", ImVec2(-panel_width - 10, 0), true);
-    ImGui::Text("Map View");
+    ImGui::Text("Map View (Pre-built + Local)");
     ImGui::Separator();
-    DrawMapViewer(true, true, true);
+
+    if (g_viewers_initialized && g_localization_viewer) {
+        // Update robot pose in viewer
+        Pose3D robot_pose = g_shared.getFusedPose();
+        g_localization_viewer->setRobotPose(robot_pose.x, robot_pose.y, robot_pose.yaw);
+
+        // Use GPU-accelerated viewer
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        g_localization_viewer->renderWidget(avail.x, avail.y);
+    } else {
+        // Fallback to CPU-based viewer
+        DrawMapViewer(true, true, true);
+    }
     ImGui::EndChild();
 
     ImGui::SameLine();
@@ -2520,8 +2895,53 @@ void DrawLocalizationTab() {
     // Relocalization status
     RelocalizationProgress reloc = g_shared.getRelocalizationProgress();
     if (reloc.running) {
+        // Show progress bar
         ImGui::ProgressBar(reloc.progress, ImVec2(-1, 20));
         ImGui::Text("%s", reloc.status_text.c_str());
+
+        // Show detailed coverage metrics while accumulating
+        if (reloc.accumulating) {
+            ImGui::Spacing();
+            ImGui::Text("Coverage Metrics:");
+
+            // Voxel progress bar
+            float voxel_ratio = static_cast<float>(reloc.local_map_voxels) / reloc.GOOD_VOXELS;
+            ImVec4 voxel_color = voxel_ratio >= 1.0f ? ImVec4(0.2f, 0.8f, 0.2f, 1.0f) :
+                                 voxel_ratio >= 0.5f ? ImVec4(0.8f, 0.8f, 0.2f, 1.0f) :
+                                                       ImVec4(0.8f, 0.4f, 0.2f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, voxel_color);
+            ImGui::ProgressBar(std::min(1.0f, voxel_ratio), ImVec2(-1, 15),
+                ("Voxels: " + std::to_string(reloc.local_map_voxels) + "/" +
+                 std::to_string(reloc.GOOD_VOXELS)).c_str());
+            ImGui::PopStyleColor();
+
+            // Rotation progress bar
+            float rot_ratio = reloc.rotation_deg / reloc.GOOD_ROTATION;
+            ImVec4 rot_color = rot_ratio >= 1.0f ? ImVec4(0.2f, 0.8f, 0.2f, 1.0f) :
+                               rot_ratio >= 0.5f ? ImVec4(0.8f, 0.8f, 0.2f, 1.0f) :
+                                                   ImVec4(0.8f, 0.4f, 0.2f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, rot_color);
+            char rot_buf[64];
+            snprintf(rot_buf, sizeof(rot_buf), "Rotation: %.0f/%.0f deg",
+                     reloc.rotation_deg, reloc.GOOD_ROTATION);
+            ImGui::ProgressBar(std::min(1.0f, rot_ratio), ImVec2(-1, 15), rot_buf);
+            ImGui::PopStyleColor();
+
+            // Coverage quality
+            ImGui::Text("Quality: %s", reloc.getCoverageQuality());
+
+            // Guidance
+            if (!reloc.isReadyToAttempt()) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                    "Slowly rotate robot to build geometry");
+            }
+        }
+
+        // Show attempt info if attempting
+        if (!reloc.accumulating && reloc.attempt_number > 0) {
+            ImGui::Text("Attempt: %d", reloc.attempt_number);
+        }
     } else if (state == AppState::LOCALIZED) {
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
             "LOCALIZED (%.0f%%)", reloc.confidence * 100.0f);
@@ -2532,23 +2952,27 @@ void DrawLocalizationTab() {
         ImGui::Text("Heading: %.1f deg", pose.yaw * 180.0f / 3.14159f);
     } else if (state == AppState::RELOCALIZE_FAILED) {
         ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.2f, 1.0f),
-            "FAILED - try different hint");
+            "FAILED after %d attempts", reloc.attempt_number);
+        ImGui::Text("Try different position or hint");
     } else if (state == AppState::MAP_LOADED) {
         ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f),
             "Map loaded - ready");
+        ImGui::Text("Click Relocalize to start");
     }
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Stop localization
-    bool can_stop = (state == AppState::LOCALIZED);
+    // Stop/Cancel button
+    bool can_stop = (state == AppState::LOCALIZED || state == AppState::RELOCALIZING);
     ImGui::BeginDisabled(!can_stop);
-    if (ImGui::Button("Stop Localization", ImVec2(-1, 30))) {
+    const char* stop_text = (state == AppState::RELOCALIZING) ? "Cancel" : "Stop Localization";
+    if (ImGui::Button(stop_text, ImVec2(-1, 30))) {
         g_commands.push(Command::simple(CommandType::STOP_LOCALIZATION));
     }
-    SetTooltip("Stop localization and return to idle.");
+    SetTooltip(state == AppState::RELOCALIZING ?
+        "Cancel localization process" : "Stop localization and return to idle.");
     ImGui::EndDisabled();
 
     ImGui::EndChild();
@@ -2996,23 +3420,77 @@ void DrawSettingsTab() {
 
     // SLAM parameters
     if (ImGui::CollapsingHeader("SLAM")) {
-        ImGui::SliderFloat("Voxel Size", &g_config.voxel_size, 0.05f, 0.5f, "%.2f m");
-        SetTooltip("Voxel filter size for map points. Larger = sparser map.");
+        ImGui::SliderFloat("Voxel Size", &g_config.voxel_size, 0.01f, 0.5f, "%.2f m");
+        SetTooltip("Voxel filter size for map points. Applied when mapping starts.");
 
         ImGui::SliderFloat("Blind Distance", &g_config.blind_distance, 0.1f, 2.0f, "%.2f m");
-        SetTooltip("Ignore LiDAR returns closer than this.");
+        SetTooltip("Ignore LiDAR returns closer than this. (Requires restart)");
 
         ImGui::SliderInt("Max Iterations", &g_config.max_iterations, 1, 6);
-        SetTooltip("IEKF iterations per scan. More = accurate but slower.");
+        SetTooltip("IEKF iterations per scan. (Requires restart)");
 
         ImGui::SliderFloat("Gyro Covariance", &g_config.gyr_cov, 0.01f, 1.0f, "%.2f");
-        SetTooltip("IMU gyroscope noise covariance.");
+        SetTooltip("IMU gyroscope noise covariance. Applied when mapping starts.");
 
         ImGui::SliderInt("Point Filter", &g_config.point_filter, 1, 5);
-        SetTooltip("Keep every Nth valid point. 1=all, 3=keep 1/3 (reduces noise).");
+        SetTooltip("Keep every Nth valid point. (Requires restart)");
 
         ImGui::Checkbox("Deskew Enabled", &g_config.deskew_enabled);
-        SetTooltip("Enable motion compensation for LiDAR scans.");
+        SetTooltip("Enable motion compensation for LiDAR scans. Applied when mapping starts.");
+    }
+
+    ImGui::Spacing();
+
+    // Viewer settings
+    if (ImGui::CollapsingHeader("3D Viewer", ImGuiTreeNodeFlags_DefaultOpen)) {
+        static bool viewer_changed = false;
+
+        ImGui::SliderFloat("Point Size", &g_config.viewer_point_size, 1.0f, 10.0f, "%.1f px");
+        SetTooltip("Size of rendered points in pixels.");
+        if (ImGui::IsItemDeactivatedAfterEdit()) viewer_changed = true;
+
+        const char* colormap_names[] = { "Grayscale", "Turbo (Rainbow)", "Viridis", "Plasma", "Inferno", "Height" };
+        ImGui::Combo("Colormap", &g_config.viewer_colormap, colormap_names, IM_ARRAYSIZE(colormap_names));
+        SetTooltip("Color scheme for point cloud visualization.");
+        if (ImGui::IsItemDeactivatedAfterEdit()) viewer_changed = true;
+
+        ImGui::Checkbox("Enable LOD", &g_config.viewer_enable_lod);
+        SetTooltip("Level of Detail - reduces points at distance for performance. Disable to see all points.");
+        if (ImGui::IsItemDeactivatedAfterEdit()) viewer_changed = true;
+
+        if (g_config.viewer_enable_lod) {
+            ImGui::SliderFloat("LOD Distance", &g_config.viewer_lod_distance, 5.0f, 50.0f, "%.0f m");
+            SetTooltip("Distance at which LOD reduction starts.");
+            if (ImGui::IsItemDeactivatedAfterEdit()) viewer_changed = true;
+        }
+
+        ImGui::SliderFloat("Min Zoom", &g_config.viewer_min_zoom, 0.1f, 5.0f, "%.1f m");
+        SetTooltip("Minimum camera distance (closest zoom).");
+        if (ImGui::IsItemDeactivatedAfterEdit()) viewer_changed = true;
+
+        ImGui::SliderFloat("Max Zoom", &g_config.viewer_max_zoom, 50.0f, 1000.0f, "%.0f m");
+        SetTooltip("Maximum camera distance (furthest zoom out).");
+        if (ImGui::IsItemDeactivatedAfterEdit()) viewer_changed = true;
+
+        int max_points_k = g_config.viewer_max_points / 1000;
+        ImGui::SliderInt("Max Points (K)", &max_points_k, 100, 10000, "%dK");
+        g_config.viewer_max_points = max_points_k * 1000;
+        SetTooltip("Maximum points to render (performance limit).");
+        if (ImGui::IsItemDeactivatedAfterEdit()) viewer_changed = true;
+
+        // Apply changes to viewers
+        if (viewer_changed && g_viewers_initialized) {
+            slam::viz::ViewerConfig config;
+            config.point_cloud.point_size = g_config.viewer_point_size;
+            config.point_cloud.colormap = static_cast<slam::viz::Colormap>(g_config.viewer_colormap);
+            config.point_cloud.enable_lod = g_config.viewer_enable_lod;
+            config.point_cloud.lod_distance = g_config.viewer_lod_distance;
+            config.point_cloud.max_visible_points = g_config.viewer_max_points;
+
+            if (g_mapping_viewer) g_mapping_viewer->setConfig(config);
+            if (g_localization_viewer) g_localization_viewer->setConfig(config);
+            viewer_changed = false;
+        }
     }
 
     ImGui::Spacing();
@@ -3021,14 +3499,28 @@ void DrawSettingsTab() {
 
     // Save/Load settings
     if (ImGui::Button("Save Settings", ImVec2(120, 30))) {
-        // TODO: Save to INI file
-        g_shared.setStatusMessage("Settings saved");
+        if (SaveSettings()) {
+            g_shared.setStatusMessage("Settings saved to " + std::string(SETTINGS_FILE));
+        } else {
+            g_shared.setErrorMessage("Failed to save settings");
+        }
     }
     SetTooltip("Save all settings to configuration file.");
 
     ImGui::SameLine();
     if (ImGui::Button("Load Defaults", ImVec2(120, 30))) {
         g_config = AppConfig();  // Reset to defaults
+        // Apply viewer defaults
+        if (g_viewers_initialized) {
+            slam::viz::ViewerConfig config;
+            config.point_cloud.point_size = g_config.viewer_point_size;
+            config.point_cloud.colormap = static_cast<slam::viz::Colormap>(g_config.viewer_colormap);
+            config.point_cloud.enable_lod = g_config.viewer_enable_lod;
+            config.point_cloud.lod_distance = g_config.viewer_lod_distance;
+            config.point_cloud.max_visible_points = g_config.viewer_max_points;
+            if (g_mapping_viewer) g_mapping_viewer->setConfig(config);
+            if (g_localization_viewer) g_localization_viewer->setConfig(config);
+        }
         g_shared.setStatusMessage("Settings reset to defaults");
     }
     SetTooltip("Reset all settings to default values.");
@@ -3131,6 +3623,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     std::string exeDir = std::filesystem::path(exePath).parent_path().string();
     strncpy(g_config.map_directory, exeDir.c_str(), sizeof(g_config.map_directory) - 1);
 
+    // Load saved settings (before anything else)
+    if (LoadSettings()) {
+        // Settings loaded successfully
+    }
+
     // Create window
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
                        GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr,
@@ -3140,6 +3637,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"SLAM Control GUI",
                               WS_OVERLAPPEDWINDOW, 50, 50, 1400, 900,
                               nullptr, nullptr, wc.hInstance, nullptr);
+    g_hwnd = hwnd;  // Store for focus checking
 
     // Initialize Direct3D
     if (!CreateDeviceD3D(hwnd)) {
@@ -3185,6 +3683,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
+    // Initialize GPU-accelerated map viewers
+    g_mapping_viewer = std::make_unique<slam::viz::SlamViewer>();
+    g_localization_viewer = std::make_unique<slam::viz::SlamViewer>();
+    if (g_mapping_viewer->initWithDevice(g_pd3dDevice, g_pd3dDeviceContext) &&
+        g_localization_viewer->initWithDevice(g_pd3dDevice, g_pd3dDeviceContext)) {
+        g_viewers_initialized = true;
+        // Configure viewers from loaded settings
+        slam::viz::ViewerConfig config;
+        config.point_cloud.point_size = g_config.viewer_point_size;
+        config.point_cloud.colormap = static_cast<slam::viz::Colormap>(g_config.viewer_colormap);
+        config.point_cloud.enable_lod = g_config.viewer_enable_lod;
+        config.point_cloud.lod_distance = g_config.viewer_lod_distance;
+        config.point_cloud.max_visible_points = g_config.viewer_max_points;
+        g_mapping_viewer->setConfig(config);
+        g_mapping_viewer->setMode(slam::viz::ViewMode::SCANNING);
+        g_localization_viewer->setConfig(config);
+        g_localization_viewer->setMode(slam::viz::ViewMode::SCANNING);  // Can switch to LOCALIZATION for hull
+    } else {
+        g_shared.setErrorMessage("Failed to initialize GPU viewers");
+    }
+
     // Scan for maps
     ScanForMaps();
 
@@ -3206,8 +3725,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     g_gamepad_config.max_speed_scale = 0.8f;
 #endif
 
-    // Start worker thread
+    // Start worker thread (SLAM processing, state management)
     g_worker_thread = std::thread(WorkerThread);
+
+    // Start high-priority control thread (motor control, CAN bus)
+    // This runs at THREAD_PRIORITY_HIGHEST to ensure consistent motor timing
+    g_control_thread = std::thread(ControlThread);
 
     // Main loop
     bool done = false;
@@ -3241,7 +3764,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         // WASD or Arrow keys: W/Up=forward, S/Down=backward, A/Left=turn left, D/Right=turn right
         float kb_linear = 0.0f, kb_angular = 0.0f;
         bool kb_active = false;
-        if (!io.WantCaptureKeyboard) {  // Don't capture if typing in ImGui
+        // Only process keyboard when:
+        // 1. Our window has focus (not typing in another app)
+        // 2. Not typing in a text input field within our GUI
+        bool window_has_focus = (GetForegroundWindow() == g_hwnd);
+        bool typing_in_textfield = io.WantTextInput;
+        if (window_has_focus && !typing_in_textfield) {
             if (GetAsyncKeyState('W') & 0x8000 || GetAsyncKeyState(VK_UP) & 0x8000) {
                 kb_linear = 1.0f;
                 kb_active = true;
@@ -3260,25 +3788,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             }
         }
 
-        // Send velocity command (gamepad has priority, keyboard as fallback)
+        // Update velocity targets directly (bypasses command queue for low latency)
+        // Control thread reads these atomics at 50Hz with highest priority
         if (!g_e_stop.load()) {
-            AppState state = g_shared.getAppState();
-            bool can_drive = (state == AppState::MAPPING || state == AppState::LOCALIZED || state == AppState::OPERATING);
-            if (can_drive) {
-                float linear = 0.0f, angular = 0.0f;
+            float linear = 0.0f, angular = 0.0f;
 
-                if (g_gamepad_connected) {
-                    // Use pre-computed drive command from getDriveCommand()
-                    linear = g_drive_cmd.linear_velocity;
-                    angular = g_drive_cmd.angular_velocity;
-                } else if (kb_active) {
-                    // Use keyboard (scaled to max_speed)
-                    linear = kb_linear * g_config.max_speed * 0.5f;  // 50% max for keyboard
-                    angular = kb_angular * 1.5f;
-                }
-
-                g_commands.push(Command::velocity(linear, angular));
+            if (g_gamepad_connected) {
+                // Use pre-computed drive command from getDriveCommand()
+                linear = g_drive_cmd.linear_velocity;
+                angular = g_drive_cmd.angular_velocity;
+            } else if (kb_active) {
+                // Use keyboard (scaled to max_speed)
+                linear = kb_linear * g_config.max_speed * 0.5f;  // 50% max for keyboard
+                angular = kb_angular * 1.5f;
             }
+
+            // Direct atomic update - control thread reads this immediately
+            g_target_linear.store(linear);
+            g_target_angular.store(angular);
+        } else {
+            // E-STOP active - ensure zero velocity
+            g_target_linear.store(0.0f);
+            g_target_angular.store(0.0f);
         }
 
         // Handle resize
@@ -3316,6 +3847,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     // Cleanup
     g_running.store(false);
+    if (g_control_thread.joinable()) {
+        g_control_thread.join();  // Join control thread first (faster shutdown)
+    }
     if (g_worker_thread.joinable()) {
         g_worker_thread.join();
     }
@@ -3328,6 +3862,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         g_gamepad.reset();
     }
 #endif
+
+    // Cleanup GPU viewers before D3D11 shutdown
+    g_mapping_viewer.reset();
+    g_localization_viewer.reset();
+    g_viewers_initialized = false;
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

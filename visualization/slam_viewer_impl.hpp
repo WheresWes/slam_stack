@@ -623,6 +623,14 @@ public:
     void appendPointCloud(const PointData* points, size_t count);
     void clearPointCloud();
 
+    // Overlay point cloud (for dual-map display)
+    void updateOverlayPointCloud(const PointData* points, size_t count);
+    void setOverlayColorTint(float r, float g, float b);
+    void clearOverlayPointCloud();
+
+    // ImGui texture access
+    void* getImGuiTexture() const;
+
     // Pose updates
     void updatePose(const M4D& pose, uint64_t timestamp_ns);
 
@@ -647,6 +655,9 @@ public:
     void resetCamera();
     void fitCameraToContent();
 
+    // Robot pose visualization
+    void setRobotPose(float x, float y, float heading);
+
     // Stats
     SlamViewer::RenderStats getStats() const;
 
@@ -657,6 +668,8 @@ private:
     bool createBuffers();
     bool createColormapTexture();
     bool createRenderTargets(int width, int height);
+    bool createWidgetRenderTarget(int width, int height);
+    void renderOverlayPointCloud();
 
     // Rendering
     void beginFrame();
@@ -665,6 +678,7 @@ private:
     void renderMesh();
     void renderProbe();
     void renderCoverage();
+    void renderRobotMarker();
 
     // Buffer management
     void swapPointBuffers();
@@ -745,12 +759,31 @@ private:
     ComPtr<ID3D11Buffer> probeVertexBuffer_;
     ComPtr<ID3D11Buffer> probeConstantBuffer_;
 
+    // Widget render target (for ImGui embedding)
+    ComPtr<ID3D11Texture2D> widgetRenderTarget_;
+    ComPtr<ID3D11RenderTargetView> widgetRTV_;
+    ComPtr<ID3D11ShaderResourceView> widgetSRV_;
+    ComPtr<ID3D11Texture2D> widgetDepthBuffer_;
+    ComPtr<ID3D11DepthStencilView> widgetDSV_;
+    int widgetTargetWidth_ = 0;
+    int widgetTargetHeight_ = 0;
+
     // Double-buffered point data
     PointBuffer pointBuffers_[2];
     std::atomic<int> writeBuffer_{0};
     std::atomic<int> readBuffer_{1};
     std::atomic<bool> pointsUpdated_{false};
     std::mutex pointMutex_;
+
+    // Overlay point cloud (for dual-map localization display)
+    PointBuffer overlayBuffers_[2];
+    std::atomic<int> overlayWriteBuffer_{0};
+    std::atomic<int> overlayReadBuffer_{1};
+    std::atomic<bool> overlayUpdated_{false};
+    std::mutex overlayMutex_;
+    ComPtr<ID3D11Buffer> overlayVertexBuffer_;
+    V3F overlayColorTint_ = V3F(0.2f, 1.0f, 0.4f);  // Default: bright green
+    size_t overlayPointCount_ = 0;
 
     // Mesh data
     std::vector<V3F> meshVertices_;
@@ -800,6 +833,14 @@ private:
     // Point bounds (for camera fit)
     V3F boundsMin_ = V3F::Zero();
     V3F boundsMax_ = V3F::Zero();
+
+    // Robot pose for visualization
+    float robotX_ = 0.0f;
+    float robotY_ = 0.0f;
+    float robotZ_ = 0.0f;
+    float robotHeading_ = 0.0f;
+    bool showRobot_ = false;
+    ComPtr<ID3D11Buffer> robotVertexBuffer_;
 };
 
 } // namespace viz

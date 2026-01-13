@@ -135,6 +135,18 @@ void SlamViewer::appendPointCloud(const PointData* points, size_t count) {
     impl_->appendPointCloud(points, count);
 }
 
+void SlamViewer::updateOverlayPointCloud(const PointData* points, size_t count) {
+    impl_->updateOverlayPointCloud(points, count);
+}
+
+void SlamViewer::setOverlayColorTint(float r, float g, float b) {
+    impl_->setOverlayColorTint(r, g, b);
+}
+
+void SlamViewer::clearOverlayPointCloud() {
+    impl_->clearOverlayPointCloud();
+}
+
 void SlamViewer::updatePose(const M4D& pose, uint64_t timestamp_ns) {
     impl_->updatePose(pose, timestamp_ns);
 }
@@ -167,6 +179,10 @@ void SlamViewer::renderWidget(float width, float height) {
     impl_->renderWidget(width, height);
 }
 
+void* SlamViewer::getImGuiTexture() const {
+    return impl_->getImGuiTexture();
+}
+
 bool SlamViewer::renderStandalone() {
     return impl_->renderStandalone();
 }
@@ -193,6 +209,10 @@ void SlamViewer::resetCamera() {
 
 void SlamViewer::fitCameraToContent() {
     impl_->fitCameraToContent();
+}
+
+void SlamViewer::setRobotPose(float x, float y, float heading) {
+    impl_->setRobotPose(x, y, heading);
 }
 
 SlamViewer::RenderStats SlamViewer::getStats() const {
@@ -888,6 +908,68 @@ bool SlamViewerImpl::createRenderTargets(int width, int height) {
     return true;
 }
 
+bool SlamViewerImpl::createWidgetRenderTarget(int width, int height) {
+    if (width <= 0 || height <= 0) return false;
+    if (width == widgetTargetWidth_ && height == widgetTargetHeight_ && widgetRenderTarget_) {
+        return true;  // Already correct size
+    }
+
+    // Release old resources
+    widgetSRV_.Reset();
+    widgetRTV_.Reset();
+    widgetRenderTarget_.Reset();
+    widgetDSV_.Reset();
+    widgetDepthBuffer_.Reset();
+
+    // Create render target texture
+    D3D11_TEXTURE2D_DESC rtd = {};
+    rtd.Width = width;
+    rtd.Height = height;
+    rtd.MipLevels = 1;
+    rtd.ArraySize = 1;
+    rtd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtd.SampleDesc.Count = 1;
+    rtd.Usage = D3D11_USAGE_DEFAULT;
+    rtd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    HRESULT hr = device_->CreateTexture2D(&rtd, nullptr, &widgetRenderTarget_);
+    if (FAILED(hr)) return false;
+
+    // Create render target view
+    hr = device_->CreateRenderTargetView(widgetRenderTarget_.Get(), nullptr, &widgetRTV_);
+    if (FAILED(hr)) return false;
+
+    // Create shader resource view (for ImGui to read)
+    hr = device_->CreateShaderResourceView(widgetRenderTarget_.Get(), nullptr, &widgetSRV_);
+    if (FAILED(hr)) return false;
+
+    // Create depth buffer for widget
+    D3D11_TEXTURE2D_DESC dtd = {};
+    dtd.Width = width;
+    dtd.Height = height;
+    dtd.MipLevels = 1;
+    dtd.ArraySize = 1;
+    dtd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dtd.SampleDesc.Count = 1;
+    dtd.Usage = D3D11_USAGE_DEFAULT;
+    dtd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+
+    hr = device_->CreateTexture2D(&dtd, nullptr, &widgetDepthBuffer_);
+    if (FAILED(hr)) return false;
+
+    hr = device_->CreateDepthStencilView(widgetDepthBuffer_.Get(), nullptr, &widgetDSV_);
+    if (FAILED(hr)) return false;
+
+    widgetTargetWidth_ = width;
+    widgetTargetHeight_ = height;
+
+    return true;
+}
+
+void* SlamViewerImpl::getImGuiTexture() const {
+    return widgetSRV_.Get();
+}
+
 void SlamViewerImpl::setConfig(const ViewerConfig& config) {
     config_ = config;
     // Update colormap texture if changed
@@ -980,6 +1062,38 @@ void SlamViewerImpl::clearPointCloud() {
         buffer.ready.store(false);
     }
     pointsUpdated_.store(true);
+}
+
+void SlamViewerImpl::updateOverlayPointCloud(const PointData* points, size_t count) {
+    if (!points || count == 0) return;
+
+    int wb = overlayWriteBuffer_.load();
+    PointBuffer& buf = overlayBuffers_[wb];
+
+    buf.points.resize(count);
+    std::memcpy(buf.points.data(), points, count * sizeof(PointData));
+    buf.count = count;
+    buf.ready.store(true);
+
+    // Swap buffers
+    int nextWrite = 1 - wb;
+    overlayWriteBuffer_.store(nextWrite);
+    overlayReadBuffer_.store(wb);
+    overlayUpdated_.store(true);
+}
+
+void SlamViewerImpl::setOverlayColorTint(float r, float g, float b) {
+    overlayColorTint_ = V3F(r, g, b);
+}
+
+void SlamViewerImpl::clearOverlayPointCloud() {
+    for (auto& buffer : overlayBuffers_) {
+        buffer.points.clear();
+        buffer.count = 0;
+        buffer.ready.store(false);
+    }
+    overlayPointCount_ = 0;
+    overlayUpdated_.store(true);
 }
 
 void SlamViewerImpl::updatePose(const M4D& pose, uint64_t timestamp_ns) {
@@ -1366,6 +1480,56 @@ void SlamViewerImpl::renderPointCloud() {
     }
 }
 
+void SlamViewerImpl::renderOverlayPointCloud() {
+    if (!overlayVertexBuffer_ || overlayPointCount_ == 0) return;
+
+    // Use geometry shader path for overlay (simpler, works with any point count)
+    // Render with a different colormap tint to distinguish from main cloud
+
+    float aspect = static_cast<float>(viewportWidth_) / static_cast<float>(viewportHeight_);
+    M4F view = camera_.getViewMatrix();
+    M4F proj = camera_.getProjectionMatrix(aspect, config_.camera_fov,
+                                            config_.camera_near, config_.camera_far);
+
+    CameraConstants cb;
+    cb.viewProj = proj * view;
+    cb.cameraPos = camera_.getPosition();
+    cb.pointSize = config_.point_cloud.point_size * 1.5f;  // Slightly larger for overlay
+    cb.screenSize = V2F(static_cast<float>(viewportWidth_), static_cast<float>(viewportHeight_));
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(context_->Map(cameraConstantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        memcpy(mapped.pData, &cb, sizeof(cb));
+        context_->Unmap(cameraConstantBuffer_.Get(), 0);
+    }
+
+    // Set shaders (GS path)
+    context_->VSSetShader(pointVS_GS_.Get(), nullptr, 0);
+    context_->VSSetConstantBuffers(0, 1, cameraConstantBuffer_.GetAddressOf());
+    context_->GSSetShader(pointGS_.Get(), nullptr, 0);
+    context_->GSSetConstantBuffers(0, 1, cameraConstantBuffer_.GetAddressOf());
+
+    // Create a tinted colormap texture for overlay (use a solid color based on tint)
+    // For simplicity, we'll just render with the same colormap but the points will
+    // appear different because the overlay is typically the local map (different geometry)
+    context_->PSSetShader(pointPS_.Get(), nullptr, 0);
+    context_->PSSetShaderResources(0, 1, colormapSRV_.GetAddressOf());
+    context_->PSSetSamplers(0, 1, colormapSampler_.GetAddressOf());
+
+    // Bind overlay vertex buffer
+    UINT stride = sizeof(PointData);
+    UINT offset = 0;
+    context_->IASetVertexBuffers(0, 1, overlayVertexBuffer_.GetAddressOf(), &stride, &offset);
+    context_->IASetInputLayout(pointLayout_GS_.Get());
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+
+    // Draw overlay points
+    context_->Draw(static_cast<UINT>(overlayPointCount_), 0);
+
+    // Clear geometry shader
+    context_->GSSetShader(nullptr, nullptr, 0);
+}
+
 void SlamViewerImpl::renderMesh() {
     if (!meshLoaded_ || !meshVS_ || !meshPS_ || !meshVertexBuffer_) return;
 
@@ -1562,15 +1726,112 @@ void SlamViewerImpl::renderWidget(float width, float height) {
     if (width > 0) size.x = width;
     if (height > 0) size.y = height;
 
+    // Clamp to reasonable size
+    size.x = std::max(size.x, 64.0f);
+    size.y = std::max(size.y, 64.0f);
+
     viewportWidth_ = static_cast<int>(size.x);
     viewportHeight_ = static_cast<int>(size.y);
 
-    // Handle mouse input for camera
-    if (ImGui::IsWindowHovered()) {
+    // Create/resize render target if needed
+    if (!createWidgetRenderTarget(viewportWidth_, viewportHeight_)) {
+        ImGui::TextColored(ImVec4(1,0,0,1), "Failed to create render target");
+        return;
+    }
+
+    // Cache camera position for LOD calculations
+    cameraPositionForLOD_ = camera_.getPosition();
+
+    // Update frustum for culling
+    if (frustumCullingEnabled_) {
+        float aspect = static_cast<float>(viewportWidth_) / static_cast<float>(viewportHeight_);
+        M4F view = camera_.getViewMatrix();
+        M4F proj = camera_.getProjectionMatrix(aspect, config_.camera_fov,
+                                                config_.camera_near, config_.camera_far);
+        frustum_.update(proj * view);
+    }
+
+    // Upload data to GPU
+    uploadPointsToGPU();
+
+    // Upload overlay points if updated
+    if (overlayUpdated_.load()) {
+        int rb = overlayReadBuffer_.load();
+        const PointBuffer& buf = overlayBuffers_[rb];
+        if (buf.ready.load() && buf.count > 0) {
+            // Create/resize overlay vertex buffer if needed
+            size_t neededSize = buf.count * sizeof(PointData);
+            if (!overlayVertexBuffer_ || overlayPointCount_ < buf.count) {
+                overlayVertexBuffer_.Reset();
+                D3D11_BUFFER_DESC vbd = {};
+                vbd.Usage = D3D11_USAGE_DYNAMIC;
+                vbd.ByteWidth = static_cast<UINT>(neededSize);
+                vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                vbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                device_->CreateBuffer(&vbd, nullptr, &overlayVertexBuffer_);
+            }
+
+            // Upload overlay points
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            if (SUCCEEDED(context_->Map(overlayVertexBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                std::memcpy(mapped.pData, buf.points.data(), buf.count * sizeof(PointData));
+                context_->Unmap(overlayVertexBuffer_.Get(), 0);
+            }
+            overlayPointCount_ = buf.count;
+        }
+        overlayUpdated_.store(false);
+    }
+
+    // Save current render target
+    ComPtr<ID3D11RenderTargetView> savedRTV;
+    ComPtr<ID3D11DepthStencilView> savedDSV;
+    context_->OMGetRenderTargets(1, &savedRTV, &savedDSV);
+
+    // Set widget render target
+    float clearColor[4] = {config_.background_color.x(), config_.background_color.y(),
+                           config_.background_color.z(), config_.background_color.w()};
+    context_->ClearRenderTargetView(widgetRTV_.Get(), clearColor);
+    context_->ClearDepthStencilView(widgetDSV_.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    context_->OMSetRenderTargets(1, widgetRTV_.GetAddressOf(), widgetDSV_.Get());
+    context_->OMSetDepthStencilState(depthStencilState_.Get(), 0);
+    context_->RSSetState(rasterizerState_.Get());
+    context_->OMSetBlendState(blendState_.Get(), nullptr, 0xFFFFFFFF);
+
+    // Set viewport
+    D3D11_VIEWPORT vp = {};
+    vp.Width = static_cast<float>(viewportWidth_);
+    vp.Height = static_cast<float>(viewportHeight_);
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    context_->RSSetViewports(1, &vp);
+
+    // Render scene
+    if (mode_ == ViewMode::SCANNING) {
+        renderPointCloud();
+        renderOverlayPointCloud();  // Render overlay on top
+        renderRobotMarker();        // Render robot position marker
+    } else {
+        renderMesh();
+        renderCoverage();
+        renderProbe();
+        renderOverlayPointCloud();  // Also show local map in localization mode
+        renderRobotMarker();        // Render robot position marker
+    }
+
+    // Restore original render target
+    context_->OMSetRenderTargets(1, savedRTV.GetAddressOf(), savedDSV.Get());
+
+    // Display as ImGui image
+    // Cast to ImTextureID (ImU64 in newer ImGui) - D3D11 backend uses SRV directly as texture ID
+    ImGui::Image(reinterpret_cast<ImTextureID>(widgetSRV_.Get()), size);
+
+    // Handle mouse input when image is hovered
+    if (ImGui::IsItemHovered()) {
         ImGuiIO& io = ImGui::GetIO();
 
         if (io.MouseDown[0]) {  // Left button - rotate
-            camera_.rotate(io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
+            // Negate X so drag-left = rotate-left (conventional behavior)
+            camera_.rotate(-io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
         }
         if (io.MouseDown[2]) {  // Middle button - pan
             camera_.pan(-io.MouseDelta.x, io.MouseDelta.y);
@@ -1579,25 +1840,6 @@ void SlamViewerImpl::renderWidget(float width, float height) {
             camera_.zoom(io.MouseWheel);
         }
     }
-
-    // Upload data to GPU
-    uploadPointsToGPU();
-
-    // Render
-    beginFrame();
-
-    if (mode_ == ViewMode::SCANNING) {
-        renderPointCloud();
-    } else {
-        renderMesh();
-        renderCoverage();
-        renderProbe();
-    }
-
-    endFrame();
-
-    // Display as ImGui image (would need render-to-texture for embedding)
-    // For now, this works for standalone mode
 }
 
 bool SlamViewerImpl::renderStandalone() {
@@ -1656,6 +1898,97 @@ void SlamViewerImpl::renderCoverage() {
     // Coverage is rendered as part of the mesh shader by sampling the coverage texture
     // This function could be used for additional coverage visualization (e.g., grid lines)
     // but for now the texture-based approach in renderMesh() handles it
+}
+
+void SlamViewerImpl::setRobotPose(float x, float y, float heading) {
+    robotX_ = x;
+    robotY_ = y;
+    robotZ_ = 0.0f;  // Robot is on the ground plane (Z=up)
+    robotHeading_ = heading;
+    showRobot_ = true;
+}
+
+void SlamViewerImpl::renderRobotMarker() {
+    if (!showRobot_) return;
+
+    // Create robot triangle marker - pointing in heading direction
+    // Robot size: ~0.3m length, ~0.2m width (reasonable for a small robot)
+    const float length = 0.3f;
+    const float width = 0.2f;
+
+    // Calculate triangle vertices in world space
+    // Heading is in radians, 0 = +X direction, positive = counter-clockwise
+    float cosH = std::cos(robotHeading_);
+    float sinH = std::sin(robotHeading_);
+
+    // Triangle pointing in heading direction:
+    //   Front tip (in direction of heading)
+    //   Back-left corner
+    //   Back-right corner
+    V3F tip(robotX_ + length * cosH, robotY_ + length * sinH, robotZ_ + 0.05f);
+    V3F backLeft(robotX_ - length * 0.3f * cosH + width * 0.5f * sinH,
+                 robotY_ - length * 0.3f * sinH - width * 0.5f * cosH,
+                 robotZ_ + 0.05f);
+    V3F backRight(robotX_ - length * 0.3f * cosH - width * 0.5f * sinH,
+                  robotY_ - length * 0.3f * sinH + width * 0.5f * cosH,
+                  robotZ_ + 0.05f);
+
+    V3F robotVerts[3] = { tip, backLeft, backRight };
+
+    // Create/update robot vertex buffer
+    if (!robotVertexBuffer_) {
+        D3D11_BUFFER_DESC vbd = {};
+        vbd.Usage = D3D11_USAGE_DYNAMIC;
+        vbd.ByteWidth = sizeof(V3F) * 3;
+        vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        vbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        device_->CreateBuffer(&vbd, nullptr, &robotVertexBuffer_);
+    }
+
+    // Upload robot vertices
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(context_->Map(robotVertexBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        std::memcpy(mapped.pData, robotVerts, sizeof(robotVerts));
+        context_->Unmap(robotVertexBuffer_.Get(), 0);
+    }
+
+    // Render using mesh shader with a bright color (cyan for visibility)
+    float aspect = static_cast<float>(viewportWidth_) / static_cast<float>(viewportHeight_);
+    M4F view = camera_.getViewMatrix();
+    M4F proj = camera_.getProjectionMatrix(aspect, config_.camera_fov,
+                                            config_.camera_near, config_.camera_far);
+
+    MeshConstants mc;
+    mc.viewProj = proj * view;
+    mc.world = M4F::Identity();
+    mc.cameraPos = camera_.getPosition();
+
+    context_->Map(meshConstantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    std::memcpy(mapped.pData, &mc, sizeof(mc));
+    context_->Unmap(meshConstantBuffer_.Get(), 0);
+
+    // Set robot color - bright cyan for high visibility
+    MaterialConstants mat;
+    mat.baseColor = V4F(0.0f, 1.0f, 1.0f, 1.0f);  // Cyan
+    mat.coveredColor = V4F(0.0f, 1.0f, 1.0f, 1.0f);
+
+    context_->Map(materialConstantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    std::memcpy(mapped.pData, &mat, sizeof(mat));
+    context_->Unmap(materialConstantBuffer_.Get(), 0);
+
+    // Draw robot triangle
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    UINT stride = sizeof(V3F);
+    UINT offset = 0;
+    context_->IASetVertexBuffers(0, 1, robotVertexBuffer_.GetAddressOf(), &stride, &offset);
+
+    context_->VSSetShader(meshVS_.Get(), nullptr, 0);
+    context_->VSSetConstantBuffers(0, 1, meshConstantBuffer_.GetAddressOf());
+    context_->GSSetShader(nullptr, nullptr, 0);
+    context_->PSSetShader(meshPS_.Get(), nullptr, 0);
+    context_->PSSetConstantBuffers(1, 1, materialConstantBuffer_.GetAddressOf());
+
+    context_->Draw(3, 0);
 }
 
 SlamViewer::RenderStats SlamViewerImpl::getStats() const {

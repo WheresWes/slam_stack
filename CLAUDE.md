@@ -78,6 +78,74 @@ The system supports three modes:
 - Call `globalRelocalize()` with optional initial guess
 - Refines pose, then hands off to IEKF localization
 
+### 5. CRITICAL: Localization Flyaway Issue (January 2026)
+
+**Problem**: Our localization mode causes "flyaway" (pose divergence) when moving through areas with sparse pre-built map coverage.
+
+**Root Cause**: Architectural difference from original FAST-LIO-Localization.
+
+#### Original FAST-LIO-Localization Architecture (Reference: `fast_lio_localization/`)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  ORIGINAL FAST-LIO-LOCALIZATION                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  PROCESS 1: laserMapping.cpp (C++)           PROCESS 2: global_localization.py │
+│  ┌────────────────────────────────┐          ┌────────────────────────┐│
+│  │ • FULL FAST-LIO SLAM - ALWAYS  │          │ • Runs at 0.5 Hz       ││
+│  │ • map_incremental() ALWAYS     │  ◄──────►│ • ICP scan-to-map      ││
+│  │ • Builds LOCAL ikd-tree        │          │ • Computes T_map_to_odom│
+│  │ • Outputs /Odometry (odom)     │          │ • Fitness threshold 95%││
+│  └────────────────────────────────┘          └────────────────────────┘│
+│                │                                        │              │
+│                └──────────────────┬─────────────────────┘              │
+│                                   ▼                                    │
+│                    transform_fusion: pose = T_map_to_odom × T_odom     │
+│                                                                        │
+│  KEY: FAST-LIO NEVER stops building its local map!                     │
+│       Global localization is a TRANSFORM CORRECTION on top.            │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Our Implementation (PROBLEMATIC)
+
+```cpp
+// slam_engine.hpp - setLocalizationMode(true) does:
+if (localization_mode_) {
+    // SKIPS mapIncremental() - NO local map building!
+    // ikd-tree contains ONLY the pre-built static map
+    // If matching fails → immediate flyaway (no fallback)
+}
+```
+
+#### Critical Differences Table
+
+| Aspect | Original FAST-LIO-Localization | Our Implementation | Risk |
+|--------|-------------------------------|---------------------|------|
+| Map Updates | ALWAYS enabled | **Disabled** in loc mode | 🔴 CRITICAL |
+| Architecture | Two-process (SLAM + Global Loc) | Single-process | 🔴 HIGH |
+| Transform Fusion | Yes (T_map_to_odom × odom) | No | 🔴 HIGH |
+| Fitness Threshold | 95% required to update | None | 🔴 HIGH |
+| cube_side_length | 1000m | 200m | 🟡 MEDIUM |
+| Fallback on Failure | Keeps old transform | No fallback | 🔴 HIGH |
+
+#### Recommended Fixes
+
+**Option A (Best)**: Implement transform fusion architecture
+1. Always run full SLAM (never disable `mapIncremental()`)
+2. Add periodic global localization (separate thread, 0.5-1 Hz)
+3. Only apply transform correction if ICP fitness > 0.9
+4. Output: `T_map_to_local × T_local_to_body`
+
+**Option B (Quick)**: Add safety checks to current implementation
+1. Add fitness threshold: reject updates if `effct_feat_num / feats_down_size < 0.3`
+2. Pose jump detection: reject if position change > 1m per frame
+3. Increase `cube_side_length` from 200 to 1000m
+4. Continue building small local map even in localization mode
+
+**Reference**: Original FAST-LIO-Localization is in `C:\Users\wmuld\OneDrive\Desktop\Documents\ATLASCpp\fast_lio_localization\`
+
 ## Key Implementation Files
 
 ```

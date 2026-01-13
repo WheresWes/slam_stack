@@ -570,10 +570,12 @@ if(HAS_IMGUI AND WIN32)
     target_include_directories(slam_gui PRIVATE
         ${PROJECT_SOURCE_DIR}/gui
         ${PROJECT_SOURCE_DIR}/common/include
+        ${PROJECT_SOURCE_DIR}/visualization  # For slam_viewer.hpp
     )
     target_link_libraries(slam_gui
         imgui::imgui
         slam_engine
+        slam_viewer  # GPU-accelerated point cloud rendering
         d3d11
         ws2_32  # For Livox native driver sockets
         # Note: Gamepad support via SDL2 through slam_engine (no XInput needed)

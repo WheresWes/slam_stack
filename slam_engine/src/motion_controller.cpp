@@ -52,6 +52,8 @@ bool MotionController::init(VescDriver* vesc, const std::string& calibration_fil
     std::cout << "  Effective track: " << (cal_.effective_track_m * 1000) << " mm" << std::endl;
     std::cout << "  Forward scaling points: " << cal_.forward_scaling.size() << std::endl;
     std::cout << "  Reverse scaling points: " << cal_.reverse_scaling.size() << std::endl;
+    std::cout << "  Turning thresholds: " << (cal_.turning_thresholds_calibrated ? "calibrated" : "using margin") << std::endl;
+    std::cout << "  Min duty margin: " << (cal_.min_duty_margin * 100) << "%" << std::endl;
 
     return true;
 }
@@ -175,6 +177,23 @@ bool MotionController::parseCalibrationFile(const std::string& path) {
             else if (key == "keep_left") cal_.reverse_min_duty.keep_left = std::stof(value);
             else if (key == "keep_right") cal_.reverse_min_duty.keep_right = std::stof(value);
         }
+        else if (current_section == "turning_forward_min_duty") {
+            cal_.turning_thresholds_calibrated = true;
+            if (key == "start_left") cal_.turning_forward_min_duty.start_left = std::stof(value);
+            else if (key == "start_right") cal_.turning_forward_min_duty.start_right = std::stof(value);
+            else if (key == "keep_left") cal_.turning_forward_min_duty.keep_left = std::stof(value);
+            else if (key == "keep_right") cal_.turning_forward_min_duty.keep_right = std::stof(value);
+        }
+        else if (current_section == "turning_reverse_min_duty") {
+            cal_.turning_thresholds_calibrated = true;
+            if (key == "start_left") cal_.turning_reverse_min_duty.start_left = std::stof(value);
+            else if (key == "start_right") cal_.turning_reverse_min_duty.start_right = std::stof(value);
+            else if (key == "keep_left") cal_.turning_reverse_min_duty.keep_left = std::stof(value);
+            else if (key == "keep_right") cal_.turning_reverse_min_duty.keep_right = std::stof(value);
+        }
+        else if (current_section == "safety") {
+            if (key == "min_duty_margin") cal_.min_duty_margin = std::stof(value);
+        }
     }
 
     // Sort scaling tables by duty
@@ -203,12 +222,26 @@ void MotionController::setVelocity(float linear_mps, float angular_radps) {
     float v_left = linear_mps - angular_radps * half_track;
     float v_right = linear_mps + angular_radps * half_track;
 
-    // Convert to ERPM (for closed-loop threshold check)
-    // This is approximate - would need motor pole count and gear ratio
-    // For now, use duty-based control
-    float max_vel = 0.5f;  // Approximate max velocity at max_duty
-    float duty_left = (v_left / max_vel) * max_duty_;
-    float duty_right = (v_right / max_vel) * max_duty_;
+    // Convert velocity to duty cycle
+    // Calibration baseline: duty 0.15 gives ~0.25 m/s
+    // Scale proportionally with max_duty_ setting
+    const float baseline_duty = 0.15f;
+    const float baseline_velocity = 0.25f;
+    float max_vel_at_max_duty = baseline_velocity * (max_duty_ / baseline_duty);
+
+    float duty_left = (v_left / max_vel_at_max_duty) * max_duty_;
+    float duty_right = (v_right / max_vel_at_max_duty) * max_duty_;
+
+    // Ensure any non-zero velocity command produces duty above start threshold
+    // This prevents a "dead zone" where small but intentional commands don't move
+    const float min_start_duty = 0.028f;  // Slightly above cal default 0.025
+
+    if (std::abs(v_left) > 0.005f && std::abs(duty_left) < min_start_duty) {
+        duty_left = std::copysign(min_start_duty, v_left);
+    }
+    if (std::abs(v_right) > 0.005f && std::abs(duty_right) < min_start_duty) {
+        duty_right = std::copysign(min_start_duty, v_right);
+    }
 
     setWheelDuty(duty_left, duty_right);
 }
@@ -219,6 +252,11 @@ void MotionController::setDuty(float linear, float angular) {
     // Track if this is straight-line motion (for hybrid control)
     // Straight line = angular is near zero
     straight_line_mode_ = (std::abs(angular) < 0.05f);
+
+    // Track if we're turning (for higher min duty thresholds)
+    // Turning = significant angular command relative to linear
+    turning_mode_ = (std::abs(angular) > 0.15f) ||
+                    (std::abs(linear) > 0.01f && std::abs(angular / linear) > 0.3f);
 
     // Differential drive: convert (linear, angular) to wheel duties
     float left = linear - angular;
@@ -461,10 +499,24 @@ float MotionController::applyThreshold(float duty, bool is_right, bool is_moving
     int sign = (duty >= 0) ? 1 : -1;
     bool is_forward = (duty >= 0);
 
-    const auto& thresholds = is_forward ? cal_.forward_min_duty : cal_.reverse_min_duty;
+    // Select appropriate thresholds based on motion type
+    MinDutyThresholds thresholds;
+    if (turning_mode_ && cal_.turning_thresholds_calibrated) {
+        // Use turning-specific thresholds (higher due to scrubbing friction)
+        thresholds = is_forward ? cal_.turning_forward_min_duty : cal_.turning_reverse_min_duty;
+    } else if (turning_mode_) {
+        // Turning but not calibrated: use straight-line thresholds with extra margin
+        const auto& base = is_forward ? cal_.forward_min_duty : cal_.reverse_min_duty;
+        thresholds = base.withMargin(1.0f + cal_.min_duty_margin * 2.0f);  // Double margin for uncalibrated turning
+    } else {
+        // Straight-line motion
+        thresholds = is_forward ? cal_.forward_min_duty : cal_.reverse_min_duty;
+    }
 
-    float start_thresh = is_right ? thresholds.start_right : thresholds.start_left;
-    float keep_thresh = is_right ? thresholds.keep_right : thresholds.keep_left;
+    // Apply safety margin
+    float margin_mult = 1.0f + cal_.min_duty_margin;
+    float start_thresh = (is_right ? thresholds.start_right : thresholds.start_left) * margin_mult;
+    float keep_thresh = (is_right ? thresholds.keep_right : thresholds.keep_left) * margin_mult;
 
     if (is_moving) {
         // Already moving - use keep threshold

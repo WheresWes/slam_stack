@@ -367,12 +367,12 @@ int main(int argc, char* argv[]) {
 
     FusionConfig fusion_config;
     fusion_config.stationary_erpm_threshold = 50;
-    fusion_config.turning_angular_threshold = 0.05f;
+    fusion_config.turning_angular_threshold = 0.2f;  // Increased: 0.2 rad/s = ~11 deg/s
     fusion_config.slam_position_alpha = 0.15f;
     fusion_config.slam_heading_alpha = 0.20f;
-    fusion_config.straight_heading_correction = 0.5f;
-    fusion_config.straight_position_correction = 0.3f;
-    fusion_config.turning_position_correction = 2.0f;
+    fusion_config.straight_heading_correction = 1.0f;  // Faster heading correction
+    fusion_config.straight_position_correction = 0.5f; // Faster position correction
+    fusion_config.turning_position_correction = 3.0f;
 
     g_fusion->init(fusion_config);
 

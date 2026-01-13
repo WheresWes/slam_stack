@@ -44,6 +44,16 @@ struct MinDutyThresholds {
     float start_right = 0.0f;
     float keep_left = 0.0f;    // Duty to maintain motion
     float keep_right = 0.0f;
+
+    // Apply a margin multiplier (e.g., 1.1 = 10% margin)
+    MinDutyThresholds withMargin(float margin) const {
+        return {
+            start_left * margin,
+            start_right * margin,
+            keep_left * margin,
+            keep_right * margin
+        };
+    }
 };
 
 struct MotionCalibration {
@@ -64,9 +74,19 @@ struct MotionCalibration {
         {0.120f, 7900},  // Extrapolated
     };
 
-    // Minimum duty thresholds
+    // Minimum duty thresholds for straight-line motion
     MinDutyThresholds forward_min_duty;
     MinDutyThresholds reverse_min_duty;
+
+    // Minimum duty thresholds for turning (higher friction due to scrubbing)
+    // If not calibrated, these default to forward/reverse values + margin
+    MinDutyThresholds turning_forward_min_duty;
+    MinDutyThresholds turning_reverse_min_duty;
+    bool turning_thresholds_calibrated = false;
+
+    // Safety margin to add on top of calibrated min duty values
+    // Applied as multiplier: actual_threshold = calibrated * (1 + margin)
+    float min_duty_margin = 0.10f;  // 10% margin by default
 
     // Robot geometry
     float effective_track_m = 0.180f;   // For differential drive kinematics
@@ -238,6 +258,7 @@ private:
     float current_duty_right_ = 0.0f;
     bool raw_mode_ = false;  // Bypass calibration
     bool straight_line_mode_ = false;  // True when both wheels should go same speed
+    bool turning_mode_ = false;  // True when differential steering (use higher min duty)
 
     // For closed-loop RPM control
     int32_t target_erpm_left_ = 0;

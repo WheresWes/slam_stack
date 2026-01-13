@@ -380,7 +380,7 @@ public:
             inet_pton(AF_INET, host_ip.c_str(), &local_addr.sin_addr);
         }
 
-        if (bind(sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
+        if (::bind(sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
             std::cerr << "Failed to bind discovery socket\n";
             closesocket(sock);
             return devices;
@@ -809,7 +809,7 @@ private:
         pc_addr.sin_port = htons(livox::HOST_PORT_POINTCLOUD);
         inet_pton(AF_INET, host_ip_.c_str(), &pc_addr.sin_addr);
 
-        if (bind(pointcloud_socket_, (sockaddr*)&pc_addr, sizeof(pc_addr)) == SOCKET_ERROR) {
+        if (::bind(pointcloud_socket_, (sockaddr*)&pc_addr, sizeof(pc_addr)) == SOCKET_ERROR) {
             std::cerr << "Failed to bind point cloud socket to " << host_ip_
                       << ":" << livox::HOST_PORT_POINTCLOUD << "\n";
             return false;
@@ -833,7 +833,7 @@ private:
         imu_addr.sin_port = htons(livox::HOST_PORT_IMU);
         inet_pton(AF_INET, host_ip_.c_str(), &imu_addr.sin_addr);
 
-        if (bind(imu_socket_, (sockaddr*)&imu_addr, sizeof(imu_addr)) == SOCKET_ERROR) {
+        if (::bind(imu_socket_, (sockaddr*)&imu_addr, sizeof(imu_addr)) == SOCKET_ERROR) {
             std::cerr << "Failed to bind IMU socket\n";
             return false;
         }
@@ -854,7 +854,7 @@ private:
         cmd_addr.sin_port = htons(livox::HOST_PORT_COMMAND);
         inet_pton(AF_INET, host_ip_.c_str(), &cmd_addr.sin_addr);
 
-        if (bind(cmd_socket_, (sockaddr*)&cmd_addr, sizeof(cmd_addr)) == SOCKET_ERROR) {
+        if (::bind(cmd_socket_, (sockaddr*)&cmd_addr, sizeof(cmd_addr)) == SOCKET_ERROR) {
             std::cerr << "Failed to bind command socket\n";
             return false;
         }

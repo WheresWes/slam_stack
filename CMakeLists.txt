@@ -124,6 +124,16 @@ if(BUILD_GUI)
     endif()
 endif()
 
+# SDL2 (optional, for gamepad controller support)
+find_package(SDL2 CONFIG QUIET)
+if(SDL2_FOUND)
+    message(STATUS "Found SDL2 - gamepad support enabled")
+    set(HAS_SDL2 TRUE)
+else()
+    message(STATUS "SDL2 not found - gamepad support disabled")
+    set(HAS_SDL2 FALSE)
+endif()
+
 #==============================================================================
 # Include Directories
 #==============================================================================
@@ -160,6 +170,13 @@ if(HAS_PCL)
         ${PROJECT_SOURCE_DIR}/slam_engine/src/motion_controller.cpp
         ${PROJECT_SOURCE_DIR}/slam_engine/src/sensor_fusion.cpp
     )
+
+    # Gamepad controller support (requires SDL2)
+    if(HAS_SDL2)
+        list(APPEND SLAM_ENGINE_SRC
+            ${PROJECT_SOURCE_DIR}/slam_engine/src/gamepad.cpp
+        )
+    endif()
 
     # Visualization source (separated for faster incremental builds)
     if(HAS_RERUN)
@@ -218,6 +235,15 @@ endif()
 if(HAS_RERUN AND HAS_PCL)
     target_link_libraries(slam_engine PUBLIC rerun_sdk)
     target_compile_definitions(slam_engine PUBLIC HAS_RERUN)
+endif()
+
+# SDL2 gamepad support (linked to slam_engine)
+if(HAS_SDL2 AND HAS_PCL)
+    target_link_libraries(slam_engine PUBLIC
+        $<TARGET_NAME_IF_EXISTS:SDL2::SDL2main>
+        $<IF:$<TARGET_EXISTS:SDL2::SDL2>,SDL2::SDL2,SDL2::SDL2-static>
+    )
+    target_compile_definitions(slam_engine PUBLIC HAS_SDL2)
 endif()
 
 #==============================================================================
@@ -415,6 +441,46 @@ if(BUILD_EXAMPLES)
         target_compile_definitions(test_sensor_fusion PRIVATE HAS_RERUN)
     endif()
 
+    # Record Fusion Data (captures LiDAR + IMU + VESC for offline testing)
+    add_executable(record_fusion_data
+        examples/record_fusion_data.cpp
+    )
+    target_link_libraries(record_fusion_data
+        slam_engine
+    )
+    if(WIN32)
+        target_link_libraries(record_fusion_data ws2_32)
+    endif()
+
+    # Replay Fusion Data (offline sensor fusion testing)
+    add_executable(replay_fusion_data
+        examples/replay_fusion_data.cpp
+    )
+    target_link_libraries(replay_fusion_data
+        slam_engine
+    )
+
+    # Gamepad controller test (requires SDL2)
+    if(HAS_SDL2)
+        add_executable(test_gamepad
+            examples/test_gamepad.cpp
+        )
+        target_link_libraries(test_gamepad
+            slam_engine
+        )
+
+        # Manual drive with gamepad (gamepad + VESC, no SLAM)
+        add_executable(manual_drive
+            examples/manual_drive.cpp
+        )
+        target_link_libraries(manual_drive
+            slam_engine
+        )
+        if(WIN32)
+            target_link_libraries(manual_drive ws2_32)
+        endif()
+    endif()
+
     # Recording analyzer (diagnose tracking issues)
     add_executable(analyze_recording
         tools/analyze_recording.cpp
@@ -484,6 +550,7 @@ endif()
 #==============================================================================
 
 if(HAS_IMGUI AND WIN32)
+    # Legacy control GUI
     add_executable(slam_control_gui WIN32
         gui/slam_control_gui.cpp
     )
@@ -495,7 +562,27 @@ if(HAS_IMGUI AND WIN32)
         NOMINMAX
         WIN32_LEAN_AND_MEAN
     )
-    message(STATUS "Building SLAM Control GUI")
+
+    # New comprehensive SLAM GUI
+    add_executable(slam_gui WIN32
+        gui/slam_gui.cpp
+    )
+    target_include_directories(slam_gui PRIVATE
+        ${PROJECT_SOURCE_DIR}/gui
+        ${PROJECT_SOURCE_DIR}/common/include
+    )
+    target_link_libraries(slam_gui
+        imgui::imgui
+        slam_engine
+        d3d11
+        ws2_32  # For Livox native driver sockets
+        # Note: Gamepad support via SDL2 through slam_engine (no XInput needed)
+    )
+    target_compile_definitions(slam_gui PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+    message(STATUS "Building SLAM GUI (comprehensive)")
 endif()
 
 #==============================================================================

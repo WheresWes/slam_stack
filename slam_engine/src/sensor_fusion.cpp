@@ -74,8 +74,20 @@ void SensorFusion::updateWheelOdometry(float linear_velocity, float angular_comm
     }
 
     // Apply fusion based on motion state
-    if (slam_initialized_ && dt > 0.0f) {
-        applyFusion(dt);
+    if (dt > 0.0f) {
+        if (slam_initialized_) {
+            // Full fusion with SLAM corrections
+            applyFusion(dt);
+        } else {
+            // Before SLAM: pure wheel dead-reckoning
+            // This ensures fused_pose tracks wheel odom from the start
+            float forward_delta = linear_velocity * dt;
+            fused_pose_.x += forward_delta * std::cos(fused_pose_.yaw);
+            fused_pose_.y += forward_delta * std::sin(fused_pose_.yaw);
+            // For heading before SLAM, use angular command (rough estimate)
+            fused_pose_.yaw += angular_command * dt;
+            fused_pose_.yaw = normalizeAngle(fused_pose_.yaw);
+        }
     }
 
     // Update velocity estimate
@@ -99,7 +111,12 @@ void SensorFusion::updateSlamPose(const Pose3D& slam_pose, uint64_t timestamp_us
     // Initialize if first SLAM update
     if (!slam_initialized_) {
         slam_smoothed_ = slam_pose;
-        fused_pose_ = slam_pose;
+        // DON'T override fused_pose_ - it already has wheel dead-reckoning
+        // Just start SLAM corrections from wherever wheels have taken us
+        // Copy Z, roll, pitch from SLAM since wheels don't track these
+        fused_pose_.z = slam_pose.z;
+        fused_pose_.roll = slam_pose.roll;
+        fused_pose_.pitch = slam_pose.pitch;
         slam_initialized_ = true;
         last_slam_time_us_ = timestamp_us;
         return;
@@ -134,12 +151,20 @@ void SensorFusion::updateSlamPose(const Eigen::Matrix4f& slam_transform, uint64_
     pose.y = slam_transform(1, 3);
     pose.z = slam_transform(2, 3);
 
-    // Extract rotation (assuming ZYX Euler)
+    // Extract rotation using atan2 for proper angle handling
+    // This avoids the range issues with Eigen's eulerAngles()
     Eigen::Matrix3f rot = slam_transform.block<3, 3>(0, 0);
-    Eigen::Vector3f euler = rot.eulerAngles(2, 1, 0);  // ZYX order
-    pose.yaw = euler[0];
-    pose.pitch = euler[1];
-    pose.roll = euler[2];
+
+    // Yaw (rotation around Z): atan2(R[1,0], R[0,0])
+    pose.yaw = std::atan2(rot(1, 0), rot(0, 0));
+
+    // Pitch (rotation around Y): -asin(R[2,0])
+    float sin_pitch = -rot(2, 0);
+    sin_pitch = std::max(-1.0f, std::min(1.0f, sin_pitch));  // Clamp for numerical stability
+    pose.pitch = std::asin(sin_pitch);
+
+    // Roll (rotation around X): atan2(R[2,1], R[2,2])
+    pose.roll = std::atan2(rot(2, 1), rot(2, 2));
 
     updateSlamPose(pose, timestamp_us);
 }
@@ -251,23 +276,71 @@ MotionState SensorFusion::detectMotionState() const {
         return MotionState::STATIONARY;
     }
 
-    // Check if turning (based on angular command, not wheel difference)
-    // Using command is more reliable than wheel ERPM difference
-    if (std::abs(wheel_angular_cmd_) > config_.turning_angular_threshold) {
-        return MotionState::TURNING;
-    }
+    // Check if turning using ERPM difference (more robust than angular command)
+    // During skid-steer turns, one wheel goes faster than the other
+    int erpm_diff = std::abs(abs_erpm_left - abs_erpm_right);
+    int avg_erpm = (abs_erpm_left + abs_erpm_right) / 2;
 
-    // Otherwise, straight line motion
-    return MotionState::STRAIGHT_LINE;
+    // Turning if ERPM difference > 30% of average, AND angular command is significant
+    // This prevents false positives from motor asymmetry during straight driving
+    bool significant_erpm_diff = (avg_erpm > 100) && (erpm_diff > avg_erpm * 0.3);
+    bool significant_angular_cmd = std::abs(wheel_angular_cmd_) > config_.turning_angular_threshold;
+
+    // Apply hysteresis: harder to enter TURNING, easier to stay in it
+    if (motion_state_ == MotionState::TURNING) {
+        // Stay in TURNING unless angular command drops significantly
+        if (std::abs(wheel_angular_cmd_) < config_.turning_angular_threshold * 0.5f) {
+            return MotionState::STRAIGHT_LINE;
+        }
+        return MotionState::TURNING;
+    } else {
+        // Enter TURNING only if angular command is clearly above threshold
+        if (significant_angular_cmd && std::abs(wheel_angular_cmd_) > config_.turning_angular_threshold * 1.5f) {
+            return MotionState::TURNING;
+        }
+        return MotionState::STRAIGHT_LINE;
+    }
 }
 
 void SensorFusion::applyFusion(float dt) {
     switch (motion_state_) {
-        case MotionState::STATIONARY:
-            // ========== STATIONARY: Freeze pose ==========
-            // Don't update anything - we trust wheels saying no motion
-            // This completely rejects SLAM jitter when stationary
+        case MotionState::STATIONARY: {
+            // ========== STATIONARY: Very slow drift correction ==========
+            // We trust wheels saying no motion, but allow slow pull toward
+            // SLAM global position to correct any accumulated error.
+            // Only apply if error exceeds threshold (prevents jitter).
+
+            float pos_error_x = slam_smoothed_.x - fused_pose_.x;
+            float pos_error_y = slam_smoothed_.y - fused_pose_.y;
+            float pos_error_mag = std::sqrt(pos_error_x * pos_error_x + pos_error_y * pos_error_y);
+
+            // Position: slow correction only if above threshold
+            if (pos_error_mag > config_.stationary_correction_threshold) {
+                float correction_rate = config_.stationary_position_correction * dt;
+                fused_pose_.x += pos_error_x * correction_rate;
+                fused_pose_.y += pos_error_y * correction_rate;
+            }
+
+            // Heading: slow correction only if above ~1 degree
+            float heading_error = angleDiff(slam_smoothed_.yaw, fused_pose_.yaw);
+            if (std::abs(heading_error) > 0.02f) {  // ~1.1 degrees
+                float heading_rate = config_.stationary_heading_correction * dt;
+                fused_pose_.yaw += heading_error * heading_rate;
+                fused_pose_.yaw = normalizeAngle(fused_pose_.yaw);
+            }
+
+            // Z, roll, pitch: also slow correct toward SLAM
+            float z_error = std::abs(slam_smoothed_.z - fused_pose_.z);
+            if (z_error > config_.stationary_correction_threshold) {
+                fused_pose_.z = lerp(fused_pose_.z, slam_smoothed_.z,
+                                     config_.stationary_position_correction * dt);
+                fused_pose_.roll = lerpAngle(fused_pose_.roll, slam_smoothed_.roll,
+                                             config_.stationary_heading_correction * dt);
+                fused_pose_.pitch = lerpAngle(fused_pose_.pitch, slam_smoothed_.pitch,
+                                              config_.stationary_heading_correction * dt);
+            }
             break;
+        }
 
         case MotionState::STRAIGHT_LINE: {
             // ========== STRAIGHT LINE: Wheel dead-reckoning + SLAM correction ==========

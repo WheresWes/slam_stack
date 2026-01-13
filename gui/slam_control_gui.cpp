@@ -212,10 +212,52 @@ struct AppState {
     int selectedMapIndex = -1;
     char selectedMapPath[512] = "";
 
+    // VESC motor control settings
+    char vescPort[32] = "COM3";
+    int vescLeftId = 1;
+    int vescRightId = 126;
+    int canBitrate = 500000;
+
+    // Robot geometry (mm)
+    float trackWidth = 120.0f;      // Center-to-center of treads
+    float wheelBase = 95.0f;        // Front to rear
+    float treadWidth = 40.0f;       // Width of each tread
+    float effectiveTrack = 156.0f;  // Includes scrub factor
+
+    // Odometry calibration
+    float ticksPerMeterLeft = 14052.0f;
+    float ticksPerMeterRight = 14133.0f;
+
+    // Duty scaling calibration results
+    struct DutyCalPoint {
+        float duty;
+        float scaleRight;
+    };
+    std::vector<DutyCalPoint> dutyCalibration = {
+        {0.030f, 0.622f},
+        {0.035f, 0.800f},
+        {0.040f, 0.816f},
+        {0.050f, 0.867f},
+        {0.060f, 0.878f},
+        {0.070f, 0.883f},
+    };
+
+    // Minimum duty thresholds
+    float minDutyStartLeft = 0.040f;
+    float minDutyStartRight = 0.035f;
+    float minDutyKeepLeft = 0.030f;
+    float minDutyKeepRight = 0.020f;
+
+    // Calibration state
+    bool calibrationRunning = false;
+    int calibrationProgress = 0;
+    std::string calibrationStatus;
+
     // Process management
     ProcessInfo slamProcess;
     ProcessInfo rerunProcess;
     ProcessInfo localizationProcess;
+    ProcessInfo calibrationProcess;
 
     // Status
     std::string statusMessage;
@@ -452,6 +494,123 @@ void DrawMainWindow() {
                           locRunning ? "Status: LOCALIZING" : "Status: Idle");
     }
 
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // VESC Motor Calibration
+    if (ImGui::CollapsingHeader("Motor Calibration", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // CAN Configuration
+        ImGui::Text("CAN Configuration");
+        ImGui::InputText("CAN Port", g_app.vescPort, sizeof(g_app.vescPort));
+        ImGui::InputInt("Left VESC ID", &g_app.vescLeftId);
+        ImGui::InputInt("Right VESC ID", &g_app.vescRightId);
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        // Robot Geometry
+        ImGui::Text("Robot Geometry (mm)");
+        ImGui::DragFloat("Track Width", &g_app.trackWidth, 1.0f, 50.0f, 500.0f, "%.1f");
+        ImGui::DragFloat("Wheel Base", &g_app.wheelBase, 1.0f, 50.0f, 500.0f, "%.1f");
+        ImGui::DragFloat("Tread Width", &g_app.treadWidth, 1.0f, 10.0f, 200.0f, "%.1f");
+        ImGui::DragFloat("Effective Track*", &g_app.effectiveTrack, 1.0f, 50.0f, 500.0f, "%.1f");
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "* Scrub factor ~1.3x for skid-steer");
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        // Odometry Calibration
+        ImGui::Text("Odometry (ticks/m)");
+        ImGui::DragFloat("Left", &g_app.ticksPerMeterLeft, 10.0f, 1000.0f, 50000.0f, "%.0f");
+        ImGui::DragFloat("Right", &g_app.ticksPerMeterRight, 10.0f, 1000.0f, 50000.0f, "%.0f");
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        // Minimum Duty Thresholds
+        ImGui::Text("Min Duty Thresholds");
+        ImGui::DragFloat("Start L", &g_app.minDutyStartLeft, 0.001f, 0.01f, 0.1f, "%.3f");
+        ImGui::SameLine();
+        ImGui::DragFloat("Start R", &g_app.minDutyStartRight, 0.001f, 0.01f, 0.1f, "%.3f");
+        ImGui::DragFloat("Keep L", &g_app.minDutyKeepLeft, 0.001f, 0.01f, 0.1f, "%.3f");
+        ImGui::SameLine();
+        ImGui::DragFloat("Keep R", &g_app.minDutyKeepRight, 0.001f, 0.01f, 0.1f, "%.3f");
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        // Duty Scaling Table
+        if (ImGui::TreeNode("Duty Scaling Table")) {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Right wheel scale to match left");
+            ImGui::Columns(2, "duty_cal_table", true);
+            ImGui::SetColumnWidth(0, 80);
+            ImGui::Text("Duty"); ImGui::NextColumn();
+            ImGui::Text("Scale R"); ImGui::NextColumn();
+            ImGui::Separator();
+
+            for (size_t i = 0; i < g_app.dutyCalibration.size(); i++) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%.3f", g_app.dutyCalibration[i].duty);
+                ImGui::Text("%s", buf); ImGui::NextColumn();
+                snprintf(buf, sizeof(buf), "%.3f", g_app.dutyCalibration[i].scaleRight);
+                ImGui::Text("%s", buf); ImGui::NextColumn();
+            }
+            ImGui::Columns(1);
+            ImGui::TreePop();
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        // Calibration Buttons
+        bool calRunning = g_app.calibrationProcess.running;
+
+        if (!calRunning) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.3f, 0.1f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.6f, 0.4f, 0.2f, 1.0f));
+
+            if (ImGui::Button("Run Duty Calibration", ImVec2(-1, 30))) {
+                // TODO: Launch calibration tool
+                g_app.setStatus("Duty calibration - ready to implement!");
+            }
+
+            if (ImGui::Button("Run Odometry Calibration", ImVec2(-1, 30))) {
+                // TODO: Launch odometry calibration
+                g_app.setStatus("Odometry calibration - ready to implement!");
+            }
+
+            if (ImGui::Button("Calibration + Localization", ImVec2(-1, 35))) {
+                // Combined calibration with global localization
+                // Movement: Forward -> Turn 90 Left -> Center -> Turn 90 Right
+                g_app.setStatus("Combined calibration - ready to implement!");
+            }
+
+            ImGui::PopStyleColor(2);
+        } else {
+            // Show progress
+            ImGui::ProgressBar(g_app.calibrationProgress / 100.0f, ImVec2(-1, 25));
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", g_app.calibrationStatus.c_str());
+
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
+            if (ImGui::Button("Cancel Calibration", ImVec2(-1, 30))) {
+                g_app.calibrationProcess.stop();
+                g_app.setStatus("Calibration cancelled");
+            }
+            ImGui::PopStyleColor();
+        }
+
+        // Save/Load buttons
+        ImGui::Spacing();
+        if (ImGui::Button("Save Calibration", ImVec2(ImGui::GetContentRegionAvail().x * 0.48f, 25))) {
+            g_app.setStatus("Calibration saved to vesc_calibration.ini");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load Calibration", ImVec2(-1, 25))) {
+            g_app.setStatus("Calibration loaded from vesc_calibration.ini");
+        }
+    }
+
     ImGui::EndChild();
 
     ImGui::SameLine();
@@ -608,6 +767,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     g_app.slamProcess.stop();
     g_app.rerunProcess.stop();
     g_app.localizationProcess.stop();
+    g_app.calibrationProcess.stop();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

@@ -255,6 +255,11 @@ public:
     std::vector<WorldPoint> getCurrentScan() const;
 
     /**
+     * @brief Get pre-built map points (for visualization)
+     */
+    std::vector<WorldPoint> getPrebuiltMapPoints() const;
+
+    /**
      * @brief Get trajectory (all poses)
      */
     std::vector<M4D> getTrajectory() const;
@@ -314,6 +319,27 @@ public:
      * Use this when starting localization with a rough initial guess.
      */
     void setInitialPose(const M4D& pose);
+
+    /**
+     * @brief Update voxel size for map filtering
+     * @param voxel_size New voxel size in meters
+     *
+     * Updates the downsampling filter leaf size and ikd-tree downsample parameter.
+     * Call this before starting a new mapping session to apply new settings.
+     */
+    void setVoxelSize(double voxel_size);
+
+    /**
+     * @brief Update gyroscope covariance
+     * @param gyr_cov Gyroscope noise covariance
+     */
+    void setGyrCov(double gyr_cov);
+
+    /**
+     * @brief Enable/disable motion deskewing
+     * @param enabled If true, points are compensated for motion during scan
+     */
+    void setDeskewEnabled(bool enabled);
 
     /**
      * @brief Perform global re-localization using ICP
@@ -1366,6 +1392,17 @@ inline std::vector<WorldPoint> SlamEngine::getCurrentScan() const {
     return points;
 }
 
+inline std::vector<WorldPoint> SlamEngine::getPrebuiltMapPoints() const {
+    std::vector<WorldPoint> points;
+    if (!prebuilt_map_loaded_) return points;
+
+    points.reserve(prebuilt_map_points_.size());
+    for (const auto& pt : prebuilt_map_points_) {
+        points.emplace_back(pt.x, pt.y, pt.z, pt.intensity);
+    }
+    return points;
+}
+
 inline std::vector<M4D> SlamEngine::getTrajectory() const {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     return trajectory_;
@@ -1488,6 +1525,43 @@ inline void SlamEngine::setInitialPose(const M4D& pose) {
               << euler.x() * 180.0 / M_PI << ", "
               << euler.y() * 180.0 / M_PI << ", "
               << euler.z() * 180.0 / M_PI << "]" << std::endl;
+}
+
+inline void SlamEngine::setVoxelSize(double voxel_size) {
+    std::cout << "[SlamEngine] Setting voxel size to " << voxel_size << "m" << std::endl;
+
+    // Update config
+    config_.filter_size_surf = voxel_size;
+    config_.filter_size_map = voxel_size;
+
+    // Update downsampling filters
+    down_size_filter_surf_.setLeafSize(static_cast<float>(voxel_size),
+                                        static_cast<float>(voxel_size),
+                                        static_cast<float>(voxel_size));
+    down_size_filter_map_.setLeafSize(static_cast<float>(voxel_size),
+                                       static_cast<float>(voxel_size),
+                                       static_cast<float>(voxel_size));
+
+    // Update ikd-tree downsample parameter
+    ikdtree_.set_downsample_param(voxel_size);
+}
+
+inline void SlamEngine::setGyrCov(double gyr_cov) {
+    std::cout << "[SlamEngine] Setting gyro covariance to " << gyr_cov << std::endl;
+    config_.gyr_cov = gyr_cov;
+    config_.acc_cov = gyr_cov;  // Use same value for accelerometer
+    if (imu_processor_) {
+        imu_processor_->setGyrCov(V3D(gyr_cov, gyr_cov, gyr_cov));
+        imu_processor_->setAccCov(V3D(gyr_cov, gyr_cov, gyr_cov));
+    }
+}
+
+inline void SlamEngine::setDeskewEnabled(bool enabled) {
+    std::cout << "[SlamEngine] Deskew " << (enabled ? "enabled" : "disabled") << std::endl;
+    config_.deskew_enabled = enabled;
+    if (imu_processor_) {
+        imu_processor_->setDeskewEnabled(enabled);
+    }
 }
 
 inline bool SlamEngine::globalRelocalize(const M4D& initial_guess) {

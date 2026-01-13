@@ -292,6 +292,8 @@ private:
     // Transition state (for open↔closed-loop handoff)
     float transition_duty_left_ = 0.0f;
     float transition_duty_right_ = 0.0f;
+    int32_t erpm_offset_left_ = 0;   // Offset between actual ERPM and dutyToErpm() at transition
+    int32_t erpm_offset_right_ = 0;
 
     // ========== Internal Methods ==========
 

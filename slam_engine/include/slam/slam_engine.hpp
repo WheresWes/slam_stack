@@ -357,6 +357,23 @@ public:
      */
     double getLocalizationFitness() const { return localization_fitness_; }
 
+    /**
+     * @brief Get the map-to-odom transform (for visualization/debugging)
+     * @return Transform from local SLAM frame to pre-built map frame
+     */
+    M4D getMapToOdomTransform() const { return T_map_to_odom_; }
+
+    /**
+     * @brief Check if transform fusion is active
+     */
+    bool isTransformInitialized() const { return transform_initialized_; }
+
+    /**
+     * @brief Get raw local SLAM pose (without map correction)
+     * Useful for debugging/visualization
+     */
+    M4D getLocalPose() const;
+
     //=========================================================================
     // Progressive Localization (coverage-based, not time-based)
     //=========================================================================
@@ -497,6 +514,15 @@ private:
      */
     void hShareModel(state_ikfom& s, esekfom::dyn_share_datastruct<double>& ekfom_data);
 
+    /**
+     * @brief Attempt global localization update (transform fusion)
+     *
+     * Runs ICP between current local map and pre-built map.
+     * Updates T_map_to_odom_ if fitness exceeds threshold.
+     * Only accepts updates with small pose jumps to prevent divergence.
+     */
+    void attemptGlobalLocalizationUpdate();
+
     //=========================================================================
     // Configuration
     //=========================================================================
@@ -595,6 +621,20 @@ private:
     bool progressive_localization_active_ = false;
     PointVector prebuilt_map_points_;  // Stored pre-built map (uses Eigen allocator)
     bool prebuilt_map_loaded_ = false;
+
+    //=========================================================================
+    // Transform Fusion (FAST-LIO-Localization architecture)
+    //=========================================================================
+    // T_map_to_odom: Transform from local SLAM frame to pre-built map frame
+    // Final pose = T_map_to_odom * local_slam_pose
+    M4D T_map_to_odom_ = M4D::Identity();
+    bool transform_initialized_ = false;
+    double last_global_localization_time_ = 0.0;
+
+    // Localization parameters
+    static constexpr double LOCALIZATION_PERIOD_S = 1.0;      // Run global localization every 1s
+    static constexpr double LOCALIZATION_FITNESS_MIN = 0.90;  // 90% fitness required (like original)
+    static constexpr double POSE_JUMP_THRESHOLD = 1.0;        // Reject corrections > 1m jump
 };
 
 //=============================================================================
@@ -688,6 +728,12 @@ inline void SlamEngine::reset() {
     localmap_initialized_ = false;
     last_timestamp_lidar_ = 0;
     last_timestamp_imu_ = -1.0;
+
+    // Reset transform fusion state
+    T_map_to_odom_ = M4D::Identity();
+    transform_initialized_ = false;
+    last_global_localization_time_ = 0.0;
+    localization_mode_ = false;
 }
 
 inline void SlamEngine::addImuData(const ImuData& imu) {
@@ -943,13 +989,22 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
 
     state_point_ = kf_.get_x();
 
-    // Add points to map (skip in localization mode)
+    // CRITICAL FIX: Always build local map (like original FAST-LIO-Localization)
+    // In localization mode, we match against pre-built map but still build local map
+    // This provides robustness when pre-built map has sparse coverage
     auto map_start = std::chrono::high_resolution_clock::now();
-    if (!localization_mode_) {
-        mapIncremental();
-    }
+    mapIncremental();  // ALWAYS called, never skipped
     auto map_end = std::chrono::high_resolution_clock::now();
     debug_timing_.map_update_us = std::chrono::duration<double, std::micro>(map_end - map_start).count();
+
+    // In localization mode, periodically attempt global localization to update T_map_to_odom
+    if (localization_mode_ && prebuilt_map_loaded_) {
+        double current_time = meas.lidar_end_time;
+        if (current_time - last_global_localization_time_ >= LOCALIZATION_PERIOD_S) {
+            attemptGlobalLocalizationUpdate();
+            last_global_localization_time_ = current_time;
+        }
+    }
 
     // Total time
     auto total_end = std::chrono::high_resolution_clock::now();
@@ -1311,9 +1366,23 @@ inline void SlamEngine::hShareModel(state_ikfom& s,
 inline SlamState SlamEngine::getState() const {
     SlamState state;
     state.timestamp_ns = static_cast<uint64_t>(lidar_end_time_ * 1e9);
-    state.rot = state_point_.rot.toRotationMatrix();
-    state.pos = V3D(state_point_.pos[0], state_point_.pos[1], state_point_.pos[2]);
-    state.vel = V3D(state_point_.vel[0], state_point_.vel[1], state_point_.vel[2]);
+
+    // In localization mode with valid transform, apply T_map_to_odom
+    if (localization_mode_ && transform_initialized_) {
+        M4D corrected_pose = getPose();  // Already applies transform
+        state.rot = corrected_pose.block<3, 3>(0, 0);
+        state.pos = corrected_pose.block<3, 1>(0, 3);
+        // Velocity also needs to be rotated into map frame
+        V3D local_vel(state_point_.vel[0], state_point_.vel[1], state_point_.vel[2]);
+        M3D R_map_to_odom = T_map_to_odom_.block<3, 3>(0, 0);
+        state.vel = R_map_to_odom * local_vel;
+    } else {
+        state.rot = state_point_.rot.toRotationMatrix();
+        state.pos = V3D(state_point_.pos[0], state_point_.pos[1], state_point_.pos[2]);
+        state.vel = V3D(state_point_.vel[0], state_point_.vel[1], state_point_.vel[2]);
+    }
+
+    // Biases and gravity don't change with transform
     state.bias_gyro = V3D(state_point_.bg[0], state_point_.bg[1], state_point_.bg[2]);
     state.bias_acc = V3D(state_point_.ba[0], state_point_.ba[1], state_point_.ba[2]);
     state.gravity = V3D(state_point_.grav[0], state_point_.grav[1], state_point_.grav[2]);
@@ -1321,10 +1390,26 @@ inline SlamState SlamEngine::getState() const {
 }
 
 inline M4D SlamEngine::getPose() const {
-    M4D pose = M4D::Identity();
-    pose.block<3, 3>(0, 0) = state_point_.rot.toRotationMatrix();
-    pose.block<3, 1>(0, 3) = V3D(state_point_.pos[0], state_point_.pos[1], state_point_.pos[2]);
-    return pose;
+    // Get local SLAM pose (in odom frame)
+    M4D local_pose = M4D::Identity();
+    local_pose.block<3, 3>(0, 0) = state_point_.rot.toRotationMatrix();
+    local_pose.block<3, 1>(0, 3) = V3D(state_point_.pos[0], state_point_.pos[1], state_point_.pos[2]);
+
+    // In localization mode with valid transform, apply T_map_to_odom
+    // Final pose = T_map_to_odom * local_pose (pose in pre-built map frame)
+    if (localization_mode_ && transform_initialized_) {
+        return T_map_to_odom_ * local_pose;
+    }
+
+    return local_pose;
+}
+
+inline M4D SlamEngine::getLocalPose() const {
+    // Always returns raw local SLAM pose (without map correction)
+    M4D local_pose = M4D::Identity();
+    local_pose.block<3, 3>(0, 0) = state_point_.rot.toRotationMatrix();
+    local_pose.block<3, 1>(0, 3) = V3D(state_point_.pos[0], state_point_.pos[1], state_point_.pos[2]);
+    return local_pose;
 }
 
 inline V3D SlamEngine::getPosition() const {
@@ -1747,29 +1832,29 @@ inline void SlamEngine::swapToPrebuiltMap(const M4D& transform) {
         return;
     }
 
-    std::cout << "[SlamEngine] Swapping to pre-built map..." << std::endl;
+    std::cout << "[SlamEngine] Initializing transform fusion localization..." << std::endl;
 
-    // Get current pose and apply transform
-    M4D current_pose = getPose();
-    M4D world_pose = transform * current_pose;
+    // NEW APPROACH: Transform Fusion (like original FAST-LIO-Localization)
+    // - Do NOT replace ikd-tree (keep building local map)
+    // - Store the discovered transform T_map_to_odom
+    // - Output pose = T_map_to_odom * local_slam_pose
 
-    // Rebuild ikd-tree with pre-built map
-    ikdtree_.~KD_TREE();
-    new (&ikdtree_) KD_TREE<PointType>();
-    ikdtree_.set_downsample_param(config_.filter_size_map);
-    ikdtree_.Build(prebuilt_map_points_);
+    // Initialize the map-to-odom transform
+    T_map_to_odom_ = transform;
+    transform_initialized_ = true;
 
-    // Update state with transformed pose
-    setInitialPose(world_pose);
-
-    // Enable localization mode
+    // Enable localization mode (activates periodic global localization updates)
     setLocalizationMode(true);
 
-    localmap_initialized_ = true;
+    // Reset the localization timer
+    last_global_localization_time_ = lidar_end_time_;
 
-    std::cout << "[SlamEngine] Map swapped successfully" << std::endl;
-    std::cout << "  ikd-tree size: " << ikdtree_.validnum() << " points" << std::endl;
-    std::cout << "  Localization mode: ENABLED" << std::endl;
+    std::cout << "[SlamEngine] Transform fusion initialized successfully" << std::endl;
+    std::cout << "  T_map_to_odom translation: ["
+              << transform(0, 3) << ", " << transform(1, 3) << ", " << transform(2, 3) << "]" << std::endl;
+    std::cout << "  Local ikd-tree size: " << ikdtree_.validnum() << " points (continuing to build)" << std::endl;
+    std::cout << "  Pre-built map size: " << prebuilt_map_points_.size() << " points" << std::endl;
+    std::cout << "  Localization mode: ENABLED (periodic ICP correction)" << std::endl;
 }
 
 inline LocalizationResult SlamEngine::checkProgressiveLocalization() {
@@ -1846,6 +1931,128 @@ inline LocalizationStatus SlamEngine::getProgressiveLocalizationStatus() const {
 inline bool SlamEngine::isProgressiveLocalizationComplete() const {
     auto status = progressive_localizer_.getStatus();
     return status == LocalizationStatus::SUCCESS || status == LocalizationStatus::FAILED;
+}
+
+//=============================================================================
+// Transform Fusion Implementation (FAST-LIO-Localization architecture)
+//=============================================================================
+
+inline void SlamEngine::attemptGlobalLocalizationUpdate() {
+    if (!prebuilt_map_loaded_ || prebuilt_map_points_.empty()) {
+        return;
+    }
+
+    // Get current local SLAM state
+    M4D local_pose = getLocalPose();
+    V3D local_pos = local_pose.block<3, 1>(0, 3);
+
+    // Get current local map points (not the pre-built map)
+    auto local_map = getMapPoints();
+    if (local_map.size() < 1000) {
+        // Not enough local map coverage yet
+        return;
+    }
+
+    // Convert local map to V3D for ICP
+    std::vector<V3D> local_points;
+    local_points.reserve(local_map.size());
+    for (const auto& pt : local_map) {
+        local_points.emplace_back(pt.x, pt.y, pt.z);
+    }
+
+    // Convert pre-built map to V3D for ICP
+    std::vector<V3D> prebuilt_points;
+    prebuilt_points.reserve(prebuilt_map_points_.size());
+    for (const auto& pt : prebuilt_map_points_) {
+        prebuilt_points.emplace_back(pt.x, pt.y, pt.z);
+    }
+
+    // Current guess: if we have a previous transform, use it
+    M4D initial_guess = M4D::Identity();
+    if (transform_initialized_) {
+        // Use current best estimate
+        initial_guess = T_map_to_odom_;
+    }
+
+    // Multi-scale ICP: local map → pre-built map
+    // This finds T such that: prebuilt = T * local
+    // So T = T_map_to_odom (transform from local/odom frame to map frame)
+
+    ICPResult final_result;
+
+    // Stage 1: Coarse (0.5m voxels)
+    {
+        auto local_down = voxelDownsample(local_points, 0.5);
+        auto prebuilt_down = voxelDownsample(prebuilt_points, 0.5);
+
+        ICPConfig cfg;
+        cfg.max_iterations = 15;
+        cfg.max_correspondence_dist = 3.0;
+        cfg.convergence_threshold = 1e-4;
+
+        ICP icp(cfg);
+        auto result = icp.align(local_down, prebuilt_down, initial_guess);
+        initial_guess = result.transformation;
+    }
+
+    // Stage 2: Medium (0.2m voxels)
+    {
+        auto local_down = voxelDownsample(local_points, 0.2);
+        auto prebuilt_down = voxelDownsample(prebuilt_points, 0.2);
+
+        ICPConfig cfg;
+        cfg.max_iterations = 20;
+        cfg.max_correspondence_dist = 1.0;
+        cfg.convergence_threshold = 1e-5;
+
+        ICP icp(cfg);
+        auto result = icp.align(local_down, prebuilt_down, initial_guess);
+        initial_guess = result.transformation;
+    }
+
+    // Stage 3: Fine (0.1m voxels)
+    {
+        auto local_down = voxelDownsample(local_points, 0.1);
+        auto prebuilt_down = voxelDownsample(prebuilt_points, 0.1);
+
+        ICPConfig cfg;
+        cfg.max_iterations = 30;
+        cfg.max_correspondence_dist = 0.5;
+        cfg.convergence_threshold = 1e-6;
+
+        ICP icp(cfg);
+        final_result = icp.align(local_down, prebuilt_down, initial_guess);
+    }
+
+    // Check fitness threshold (like original FAST-LIO-Localization: 95%)
+    if (final_result.fitness_score < LOCALIZATION_FITNESS_MIN) {
+        // Fitness too low - don't update transform
+        std::cout << "[Localization] Rejected update: fitness=" << final_result.fitness_score
+                  << " (need >=" << LOCALIZATION_FITNESS_MIN << ")" << std::endl;
+        return;
+    }
+
+    // Check for pose jump (sanity check)
+    if (transform_initialized_) {
+        V3D old_pos = T_map_to_odom_.block<3, 1>(0, 3);
+        V3D new_pos = final_result.transformation.block<3, 1>(0, 3);
+        double pos_jump = (new_pos - old_pos).norm();
+
+        if (pos_jump > POSE_JUMP_THRESHOLD) {
+            // Jump too large - something went wrong
+            std::cout << "[Localization] Rejected update: position jump=" << pos_jump
+                      << "m (max=" << POSE_JUMP_THRESHOLD << "m)" << std::endl;
+            return;
+        }
+    }
+
+    // Accept the update
+    T_map_to_odom_ = final_result.transformation;
+    transform_initialized_ = true;
+    localization_fitness_ = final_result.fitness_score;
+
+    std::cout << "[Localization] Transform updated: fitness=" << final_result.fitness_score
+              << " rmse=" << final_result.rmse << "m" << std::endl;
 }
 
 } // namespace slam

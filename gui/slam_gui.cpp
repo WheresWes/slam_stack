@@ -25,6 +25,7 @@
 #include <tchar.h>
 #include <string>
 #include <vector>
+#include <deque>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -198,8 +199,9 @@ static std::unique_ptr<slam::SensorFusion> g_fusion;
 static std::unique_ptr<slam::MotionController> g_motion;
 
 // IMU queue for thread-safe callback handling
+// PERFORMANCE FIX: Use deque instead of vector for O(1) front removal
 static std::mutex g_imu_mutex;
-static std::vector<slam::ImuData> g_imu_queue;
+static std::deque<slam::ImuData> g_imu_queue;
 
 // Point cloud accumulation (matches live_slam.cpp pattern)
 static std::mutex g_scan_mutex;
@@ -722,8 +724,9 @@ void OnIMU(const slam::LivoxIMUFrame& frame) {
     }
 
     // Keep buffer bounded
-    if (g_imu_queue.size() > 100) {
-        g_imu_queue.erase(g_imu_queue.begin(), g_imu_queue.begin() + 50);
+    // PERFORMANCE FIX: Use pop_front (O(1) for deque) instead of erase (O(n) for vector)
+    while (g_imu_queue.size() > 100) {
+        g_imu_queue.pop_front();
     }
 }
 

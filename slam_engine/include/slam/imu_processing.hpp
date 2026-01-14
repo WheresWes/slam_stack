@@ -82,6 +82,12 @@ public:
     void setAccBiasCov(const V3D& cov) { cov_bias_acc_ = cov; }
 
     /**
+     * @brief Set low-pass filter coefficient for vibration compensation
+     * @param alpha Filter coefficient (0=disabled, 0.3-0.5=moderate, 0.7-0.9=heavy)
+     */
+    void setLpfAlpha(double alpha) { lpf_alpha_ = std::clamp(alpha, 0.0, 0.95); }
+
+    /**
      * @brief Process synchronized IMU and LiDAR measurements
      * @param meas Measurement group containing IMU and LiDAR data
      * @param kf_state Kalman filter state (modified in-place)
@@ -172,6 +178,12 @@ private:
 
     // Debug output
     std::ofstream fout_imu_;
+
+    // Low-pass filter for vibration compensation
+    double lpf_alpha_ = 0.0;        // Filter coefficient (0=disabled)
+    V3D lpf_gyr_ = V3D::Zero();     // Filtered gyroscope
+    V3D lpf_acc_ = V3D::Zero();     // Filtered accelerometer
+    bool lpf_initialized_ = false;  // First sample flag
 };
 
 //=============================================================================
@@ -213,6 +225,11 @@ inline void ImuProcessor::reset() {
     IMUpose_.clear();
     last_imu_ = ImuData();
     initial_rotation_ = M3D::Identity();
+
+    // Reset low-pass filter state
+    lpf_gyr_ = V3D::Zero();
+    lpf_acc_ = V3D::Zero();
+    lpf_initialized_ = false;
 }
 
 inline void ImuProcessor::setExtrinsic(const V3D& translation, const M3D& rotation) {
@@ -379,9 +396,29 @@ inline void ImuProcessor::undistortPointCloud(
 
         if (tail.timestamp_sec() < last_lidar_end_time_) continue;
 
-        // Average IMU measurements
+        // Average IMU measurements between consecutive samples
         angvel_avr = 0.5 * (head.gyro + tail.gyro);
         acc_avr = 0.5 * (head.acc + tail.acc);
+
+        // Apply low-pass filter for vibration compensation (if enabled)
+        // Filter the AVERAGED result to properly attenuate high-frequency noise
+        if (lpf_alpha_ > 0.001) {
+            if (!lpf_initialized_) {
+                // Initialize filter with first sample
+                lpf_gyr_ = angvel_avr;
+                lpf_acc_ = acc_avr;
+                lpf_initialized_ = true;
+            }
+            // Exponential moving average: filtered = alpha * raw + (1-alpha) * prev
+            // Lower alpha = more smoothing (more filtering)
+            // At alpha=0.03 and 200Hz IMU: time constant ≈ 1/(0.03*200) = 0.17s
+            lpf_gyr_ = lpf_alpha_ * angvel_avr + (1.0 - lpf_alpha_) * lpf_gyr_;
+            lpf_acc_ = lpf_alpha_ * acc_avr + (1.0 - lpf_alpha_) * lpf_acc_;
+
+            // Use filtered values
+            angvel_avr = lpf_gyr_;
+            acc_avr = lpf_acc_;
+        }
 
         // Scale acceleration to proper units
         acc_avr = acc_avr * G_m_s2 / mean_acc_.norm();

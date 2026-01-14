@@ -60,10 +60,18 @@ namespace slam {
 
 struct SlamConfig {
     // IMU noise parameters
-    double gyr_cov = 0.1;
-    double acc_cov = 0.1;
-    double b_gyr_cov = 0.0001;
-    double b_acc_cov = 0.0001;
+    // Higher values = trust IMU less (recommended for vibrating platforms)
+    // Default 0.2 provides better tolerance to chassis vibration
+    double gyr_cov = 0.2;           // Gyroscope noise covariance (0.1=low noise, 0.5=high vibration)
+    double acc_cov = 0.2;           // Accelerometer noise covariance
+    double b_gyr_cov = 0.0001;      // Gyro bias random walk
+    double b_acc_cov = 0.0001;      // Accel bias random walk
+
+    // Vibration compensation - low-pass filter for IMU
+    // Alpha = 0: no filtering (pass-through)
+    // Alpha = 0.3-0.5: moderate filtering (recommended for ground robots)
+    // Alpha = 0.7-0.9: heavy filtering (for high-vibration environments)
+    double imu_lpf_alpha = 0.3;     // Low-pass filter coefficient (0=disabled)
 
     // Map parameters
     double filter_size_surf = 0.5;      // Downsampling voxel size for scan
@@ -74,7 +82,7 @@ struct SlamConfig {
                                         // Note: Not used in algorithm, kept for documentation
 
     // Optimization
-    int max_iterations = 5;             // 5 recommended for motion (original FAST-LIO uses 3-4)
+    int max_iterations = 4;             // 4 matches original FAST-LIO default
     int max_points_icp = 0;             // Max points for IEKF matching (0 = unlimited)
     int max_map_points = 0;             // Max map points (0 = unlimited, uses cube_len for spatial limits)
 
@@ -90,6 +98,13 @@ struct SlamConfig {
 
     // Motion compensation
     bool deskew_enabled = true;
+
+    // Flyaway protection
+    // At 10 Hz SLAM and max robot speed 0.6 m/s, max expected position change is ~6 cm/scan
+    // Use 30 cm threshold to allow for IMU drift but catch flyaways (3 m/s equivalent)
+    double max_position_jump = 0.3;     // Max allowed position jump (m) before rejection
+    double max_rotation_jump_deg = 20.0; // Max allowed rotation jump (deg) before rejection
+    int min_effective_points = 50;       // Min matched points required for valid update
 
     // Output
     bool dense_output = true;           // Output dense (vs downsampled) clouds
@@ -340,6 +355,12 @@ public:
      * @param enabled If true, points are compensated for motion during scan
      */
     void setDeskewEnabled(bool enabled);
+
+    /**
+     * @brief Set IMU low-pass filter coefficient for vibration compensation
+     * @param alpha Filter coefficient (0=disabled, 0.3-0.5=moderate, 0.7-0.9=heavy)
+     */
+    void setImuLpfAlpha(double alpha);
 
     /**
      * @brief Perform global re-localization using ICP
@@ -710,6 +731,7 @@ inline bool SlamEngine::init(const SlamConfig& config) {
     imu_processor_->setAccCov(V3D(config_.acc_cov, config_.acc_cov, config_.acc_cov));
     imu_processor_->setGyrBiasCov(V3D(config_.b_gyr_cov, config_.b_gyr_cov, config_.b_gyr_cov));
     imu_processor_->setAccBiasCov(V3D(config_.b_acc_cov, config_.b_acc_cov, config_.b_acc_cov));
+    imu_processor_->setLpfAlpha(config_.imu_lpf_alpha);
 
     // Initialize downsampling filters
     down_size_filter_surf_.setLeafSize(config_.filter_size_surf,
@@ -1016,6 +1038,11 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
     feats_down_world_->resize(feats_down_size_);
     nearest_points_.resize(feats_down_size_);
 
+    // Save state before IEKF update for jump detection
+    state_ikfom state_before = kf_.get_x();
+    V3D pos_before(state_before.pos[0], state_before.pos[1], state_before.pos[2]);
+    M3D rot_before = state_before.rot.toRotationMatrix();
+
     // EKF update (ICP iteration)
     auto icp_start = std::chrono::high_resolution_clock::now();
     double solve_H_time = 0;
@@ -1024,6 +1051,91 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
     debug_timing_.icp_us = std::chrono::duration<double, std::micro>(icp_end - icp_start).count();
 
     state_point_ = kf_.get_x();
+
+    // ==========================================================================
+    // FLYAWAY PROTECTION: Check for pose jumps WITH insufficient point support
+    // ==========================================================================
+    // Key insight: Large IEKF corrections are NORMAL and VALID if supported by
+    // many matched points. Only reject if we have BOTH a large jump AND poor
+    // point support (few effective points = unreliable correction).
+
+    bool update_rejected = false;
+    bool low_point_count = (effct_feat_num_ < config_.min_effective_points && effct_feat_num_ > 0);
+
+    // Calculate position and rotation jumps
+    V3D pos_after(state_point_.pos[0], state_point_.pos[1], state_point_.pos[2]);
+    double pos_jump = (pos_after - pos_before).norm();
+
+    M3D rot_after = state_point_.rot.toRotationMatrix();
+    M3D rot_diff = rot_before.transpose() * rot_after;
+    double trace_val = rot_diff.trace();
+    double angle_rad = std::acos(std::clamp((trace_val - 1.0) / 2.0, -1.0, 1.0));
+    double angle_deg = angle_rad * 180.0 / M_PI;
+
+    bool large_pos_jump = (pos_jump > config_.max_position_jump);
+    bool large_rot_jump = (angle_deg > config_.max_rotation_jump_deg);
+
+    // FLYAWAY DETECTION: Reject only if BOTH conditions met:
+    // 1. Large pose change (position OR rotation)
+    // 2. Low effective point count (unreliable update)
+    if (low_point_count && (large_pos_jump || large_rot_jump)) {
+        std::cerr << "[SlamEngine] FLYAWAY DETECTED: "
+                  << "pos_jump=" << pos_jump << "m, rot_jump=" << angle_deg << "°, "
+                  << "effective_pts=" << effct_feat_num_ << " (min:" << config_.min_effective_points << ")"
+                  << " - rejecting unreliable update!" << std::endl;
+        update_rejected = true;
+    }
+    // Also reject extreme jumps regardless of point count (true flyaway)
+    else if (pos_jump > 2.0 || angle_deg > 60.0) {
+        std::cerr << "[SlamEngine] EXTREME FLYAWAY: "
+                  << "pos_jump=" << pos_jump << "m, rot_jump=" << angle_deg << "°"
+                  << " - rejecting catastrophic update!" << std::endl;
+        update_rejected = true;
+    }
+    // Log warnings for borderline cases (don't reject, but track)
+    else if (large_pos_jump || large_rot_jump) {
+        static int warn_count = 0;
+        if (warn_count++ % 10 == 0) {  // Only log every 10th warning
+            std::cout << "[SlamEngine] Large correction (OK - " << effct_feat_num_ << " pts): "
+                      << "pos=" << pos_jump << "m, rot=" << angle_deg << "°" << std::endl;
+        }
+    }
+
+    // If update was rejected, revert to pre-update state
+    if (update_rejected) {
+        kf_.change_x(state_before);
+        state_point_ = state_before;
+        // Log detailed state for debugging
+        std::cerr << "[SlamEngine] Reverted to pre-update state (IMU-only propagation)" << std::endl;
+        std::cerr << "  IMU Biases: gyro=(" << state_before.bg[0] << "," << state_before.bg[1] << "," << state_before.bg[2]
+                  << ") accel=(" << state_before.ba[0] << "," << state_before.ba[1] << "," << state_before.ba[2] << ")" << std::endl;
+        std::cerr << "  Velocity: (" << state_before.vel[0] << "," << state_before.vel[1] << "," << state_before.vel[2] << ")" << std::endl;
+    }
+
+    // Periodic state monitoring (every 100 frames) to track bias drift
+    static int monitor_count = 0;
+    if (++monitor_count >= 100) {
+        monitor_count = 0;
+        double bg_norm = std::sqrt(state_point_.bg[0]*state_point_.bg[0] +
+                                   state_point_.bg[1]*state_point_.bg[1] +
+                                   state_point_.bg[2]*state_point_.bg[2]);
+        double ba_norm = std::sqrt(state_point_.ba[0]*state_point_.ba[0] +
+                                   state_point_.ba[1]*state_point_.ba[1] +
+                                   state_point_.ba[2]*state_point_.ba[2]);
+        double vel_norm = std::sqrt(state_point_.vel[0]*state_point_.vel[0] +
+                                    state_point_.vel[1]*state_point_.vel[1] +
+                                    state_point_.vel[2]*state_point_.vel[2]);
+        // Warn if biases are growing suspiciously large
+        if (bg_norm > 0.1 || ba_norm > 1.0) {
+            std::cerr << "[SlamEngine] WARNING: Large IMU bias detected! "
+                      << "gyro_bias=" << bg_norm << " rad/s, accel_bias=" << ba_norm << " m/s^2" << std::endl;
+        }
+        // Log state summary
+        std::cout << "[SLAM State] pos=(" << state_point_.pos[0] << "," << state_point_.pos[1] << "," << state_point_.pos[2]
+                  << ") vel=" << vel_norm << " bg=" << bg_norm << " ba=" << ba_norm
+                  << " pts=" << effct_feat_num_ << std::endl;
+    }
+    // ==========================================================================
 
     // CRITICAL FIX: Always build local map (like original FAST-LIO-Localization)
     // In localization mode, we match against pre-built map but still build local map
@@ -1162,9 +1274,31 @@ inline void SlamEngine::lasermapFovSegment() {
 }
 
 inline void SlamEngine::mapIncremental() {
-    // Skip map update if map is at max size (prevents unbounded growth)
-    if (config_.max_map_points > 0 && ikdtree_.validnum() >= static_cast<size_t>(config_.max_map_points)) {
-        return;  // Map is full, rely on FOV pruning to make room
+    // Check if map is approaching max size
+    bool at_max_capacity = false;
+    if (config_.max_map_points > 0) {
+        size_t current_size = ikdtree_.validnum();
+        size_t limit = static_cast<size_t>(config_.max_map_points);
+
+        // Warn when approaching 90% capacity
+        if (current_size >= limit * 9 / 10 && current_size < limit) {
+            static int warn_count = 0;
+            if (warn_count++ % 100 == 0) {  // Only warn every 100 frames
+                std::cerr << "[SlamEngine] WARNING: Map approaching max capacity ("
+                          << current_size << "/" << limit << " points)" << std::endl;
+            }
+        }
+
+        // At max capacity - still process but skip adding points
+        if (current_size >= limit) {
+            at_max_capacity = true;
+            static int skip_count = 0;
+            if (skip_count++ % 500 == 0) {  // Warn every 500 frames
+                std::cerr << "[SlamEngine] Map at max capacity (" << limit
+                          << " points) - relying on FOV pruning. Consider increasing max_map_points." << std::endl;
+            }
+            // Note: We continue processing for debug stats, just skip adding
+        }
     }
 
     PointVector point_to_add;
@@ -1260,12 +1394,17 @@ inline void SlamEngine::mapIncremental() {
         std::cout << "[DEBUG mapIncr] Frame " << debug_frame
                   << ": body_max=" << max_dist_body << "m, world_max=" << max_dist_world << "m"
                   << ", corrupt=" << corrupt_this_frame << " (total=" << corrupt_count_total << ")"
-                  << ", adding=" << point_to_add.size() << "+" << point_no_need_downsample.size()
+                  << ", adding=" << (at_max_capacity ? 0 : point_to_add.size()) << "+"
+                  << (at_max_capacity ? 0 : point_no_need_downsample.size())
+                  << (at_max_capacity ? " (SKIPPED - at capacity)" : "")
                   << std::endl;
     }
 
-    ikdtree_.Add_Points(point_to_add, true);
-    ikdtree_.Add_Points(point_no_need_downsample, false);
+    // Add points to map (skip if at max capacity - rely on FOV pruning)
+    if (!at_max_capacity) {
+        ikdtree_.Add_Points(point_to_add, true);
+        ikdtree_.Add_Points(point_no_need_downsample, false);
+    }
 }
 
 inline void SlamEngine::hShareModel(state_ikfom& s,
@@ -1696,6 +1835,13 @@ inline void SlamEngine::setDeskewEnabled(bool enabled) {
     config_.deskew_enabled = enabled;
     if (imu_processor_) {
         imu_processor_->setDeskewEnabled(enabled);
+    }
+}
+
+inline void SlamEngine::setImuLpfAlpha(double alpha) {
+    config_.imu_lpf_alpha = alpha;
+    if (imu_processor_) {
+        imu_processor_->setLpfAlpha(alpha);
     }
 }
 

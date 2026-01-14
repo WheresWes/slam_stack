@@ -3,7 +3,7 @@
 ## Critical
 
 ### 0. SLAM Flyaway Issue (Pose Divergence)
-**Status**: Active investigation
+**Status**: MITIGATED (January 2026)
 **Description**: SLAM pose suddenly diverges ("flies away") even when processing time is acceptable.
 
 **Symptoms:**
@@ -12,21 +12,30 @@
 - Can happen even with SLAM time < 50ms
 - Map becomes corrupted after flyaway
 
-**Potential causes under investigation:**
-- [ ] IEKF not converging (insufficient iterations?)
-- [ ] Degenerate geometry (insufficient plane constraints)
-- [ ] Numerical instability in covariance update
-- [ ] Point-to-plane residual outliers not rejected
-- [ ] IMU propagation error accumulation
-- [ ] ikd-tree nearest neighbor errors at map boundaries
-- [ ] State covariance growing unbounded
+**Mitigations Implemented:**
 
-**Comparison with FAST-LIO needed:**
-- [ ] IEKF convergence criteria
-- [ ] Residual outlier rejection
-- [ ] Covariance bounds/reset
-- [ ] Point plane fitting validity checks
+1. **Pose Jump Rejection** (slam_engine.hpp)
+   - Position jump > 0.3m → update rejected, fallback to IMU propagation
+   - Rotation jump > 20° → update rejected, fallback to IMU propagation
+   - Configurable via `max_position_jump` and `max_rotation_jump_deg`
+
+2. **Minimum Effective Points Threshold** (slam_engine.hpp)
+   - If matched points < 50 → update rejected as degenerate
+   - Configurable via `min_effective_points`
+
+3. **Max Map Points Warning** (slam_engine.hpp)
+   - Warns at 90% capacity instead of silently stopping
+   - Continues to warn every 500 frames at capacity
+
+**GUI Controls Added** (Settings > SLAM):
+- Max Pos Jump (m) - default 0.3m
+- Max Rot Jump (deg) - default 20°
+- Min Effective Pts - default 50
+
+**Still to investigate if issues persist:**
+- [ ] Covariance bounds (prevent unbounded growth)
 - [ ] IMU bias estimation stability
+- [ ] ikd-tree edge cases
 
 ---
 

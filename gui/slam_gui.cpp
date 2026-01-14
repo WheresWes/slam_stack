@@ -31,6 +31,7 @@
 #include <chrono>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <filesystem>
 #include <cmath>
 #include <limits>
@@ -115,6 +116,12 @@ struct AppConfig {
     int point_filter = 3;         // Keep every Nth point (1=all, 3=keep 1/3)
     int max_points_icp = 2000;    // CRITICAL: Limit points in IEKF matching (0=unlimited)
     int max_map_points = 500000;  // Max map points to prevent ikd-tree slowdown (0=unlimited)
+
+    // Flyaway protection
+    float max_position_jump = 0.3f;     // Max allowed position jump (m) before rejection
+    float max_rotation_jump = 20.0f;    // Max allowed rotation jump (deg) before rejection
+    int min_effective_points = 50;      // Min matched points required for valid update
+    float imu_lpf_alpha = 0.3f;         // IMU low-pass filter (0=disabled, 0.3-0.5=moderate)
 
     // Fusion parameters
     float slam_alpha_pos = 0.60f;
@@ -213,6 +220,13 @@ static std::atomic<uint64_t> g_point_frame_count{0};
 static std::atomic<uint64_t> g_imu_count{0};
 static std::atomic<uint64_t> g_scan_count{0};
 static std::atomic<uint64_t> g_slam_process_count{0};
+
+// IMU CSV recording for vibration analysis
+static std::atomic<bool> g_imu_recording{false};
+static std::ofstream g_imu_csv_file;
+static std::mutex g_imu_csv_mutex;
+static uint64_t g_imu_record_start_ns{0};
+static size_t g_imu_record_count{0};
 #endif
 
 // Gamepad state
@@ -366,6 +380,10 @@ bool SaveSettings() {
     f << "gyr_cov=" << g_config.gyr_cov << "\n";
     f << "deskew_enabled=" << (g_config.deskew_enabled ? 1 : 0) << "\n";
     f << "point_filter=" << g_config.point_filter << "\n";
+    f << "max_position_jump=" << g_config.max_position_jump << "\n";
+    f << "max_rotation_jump=" << g_config.max_rotation_jump << "\n";
+    f << "min_effective_points=" << g_config.min_effective_points << "\n";
+    f << "imu_lpf_alpha=" << g_config.imu_lpf_alpha << "\n";
 
     f << "\n[Fusion]\n";
     f << "slam_alpha_pos=" << g_config.slam_alpha_pos << "\n";
@@ -424,6 +442,10 @@ bool LoadSettings() {
         else if (key == "gyr_cov") g_config.gyr_cov = std::stof(value);
         else if (key == "deskew_enabled") g_config.deskew_enabled = (std::stoi(value) != 0);
         else if (key == "point_filter") g_config.point_filter = std::stoi(value);
+        else if (key == "max_position_jump") g_config.max_position_jump = std::stof(value);
+        else if (key == "max_rotation_jump") g_config.max_rotation_jump = std::stof(value);
+        else if (key == "min_effective_points") g_config.min_effective_points = std::stoi(value);
+        else if (key == "imu_lpf_alpha") g_config.imu_lpf_alpha = std::stof(value);
         // Fusion
         else if (key == "slam_alpha_pos") g_config.slam_alpha_pos = std::stof(value);
         else if (key == "slam_alpha_hdg") g_config.slam_alpha_hdg = std::stof(value);
@@ -681,6 +703,22 @@ void OnIMU(const slam::LivoxIMUFrame& frame) {
             static_cast<float>(imu.acc.x()), static_cast<float>(imu.acc.y()), static_cast<float>(imu.acc.z()),
             static_cast<float>(imu.gyro.x()), static_cast<float>(imu.gyro.y()), static_cast<float>(imu.gyro.z()),
             gravity_mag, imu_init);
+    }
+
+    // CSV recording for vibration analysis
+    if (g_imu_recording.load()) {
+        std::lock_guard<std::mutex> csv_lock(g_imu_csv_mutex);
+        if (g_imu_csv_file.is_open()) {
+            if (g_imu_record_start_ns == 0) {
+                g_imu_record_start_ns = frame.timestamp_ns;
+            }
+            double time_s = (frame.timestamp_ns - g_imu_record_start_ns) / 1e9;
+            g_imu_csv_file << std::fixed << std::setprecision(6)
+                << time_s << ","
+                << frame.gyro.x() << "," << frame.gyro.y() << "," << frame.gyro.z() << ","
+                << frame.accel.x() << "," << frame.accel.y() << "," << frame.accel.z() << "\n";
+            g_imu_record_count++;
+        }
     }
 
     // Keep buffer bounded
@@ -1215,6 +1253,11 @@ bool InitializeHardware() {
     slam_config.max_points_icp = g_config.max_points_icp;  // CRITICAL for real-time performance
     slam_config.max_map_points = g_config.max_map_points;  // Limit map growth to prevent slowdown
     slam_config.deskew_enabled = g_config.deskew_enabled;
+    // Flyaway protection
+    slam_config.max_position_jump = g_config.max_position_jump;
+    slam_config.max_rotation_jump_deg = g_config.max_rotation_jump;
+    slam_config.min_effective_points = g_config.min_effective_points;
+    slam_config.imu_lpf_alpha = g_config.imu_lpf_alpha;  // Vibration compensation
     slam_config.save_map = true;
     if (!g_slam->init(slam_config)) {
         g_shared.setErrorMessage("Failed to initialize SLAM engine");
@@ -1632,6 +1675,22 @@ void WorkerThread() {
                 case CommandType::RELOCALIZE:
                     if ((g_shared.getAppState() == AppState::MAP_LOADED ||
                          g_shared.getAppState() == AppState::RELOCALIZE_FAILED) && g_slam) {
+                        // CRITICAL FIX: Reset SLAM engine before starting progressive localization
+                        // This clears the old ikd-tree and EKF state from previous mapping session.
+                        // Without this reset, new LiDAR scans would match against stale map points,
+                        // causing immediate flyaway.
+                        g_slam->reset();
+
+                        // Apply current settings (same as START_MAPPING)
+                        g_slam->setVoxelSize(g_config.voxel_size);
+                        g_slam->setGyrCov(g_config.gyr_cov);
+                        g_slam->setDeskewEnabled(g_config.deskew_enabled);
+                        g_slam->setImuLpfAlpha(g_config.imu_lpf_alpha);
+
+                        if (g_fusion) {
+                            g_fusion->reset();
+                        }
+
                         // Start progressive localization
                         // FAST-LIO will build a local map, which we match against the pre-built map
                         g_shared.setAppState(AppState::RELOCALIZING);
@@ -4254,6 +4313,54 @@ void DrawDiagnosticsTab() {
     }
 
     ImGui::Spacing();
+
+    // IMU CSV Recording for vibration analysis
+    if (ImGui::CollapsingHeader("IMU Recording", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool is_recording = g_imu_recording.load();
+
+        if (is_recording) {
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "RECORDING: %zu samples", g_imu_record_count);
+        } else {
+            ImGui::Text("Record raw IMU data for vibration analysis");
+        }
+
+        ImGui::Spacing();
+
+        if (!is_recording) {
+            if (ImGui::Button("Start Recording", ImVec2(150, 30))) {
+                std::lock_guard<std::mutex> lock(g_imu_csv_mutex);
+                // Generate filename with timestamp
+                auto now = std::chrono::system_clock::now();
+                auto time_t = std::chrono::system_clock::to_time_t(now);
+                std::tm tm_buf;
+                localtime_s(&tm_buf, &time_t);
+                char filename[64];
+                std::strftime(filename, sizeof(filename), "imu_data_%Y%m%d_%H%M%S.csv", &tm_buf);
+
+                g_imu_csv_file.open(filename);
+                if (g_imu_csv_file.is_open()) {
+                    // Write header
+                    g_imu_csv_file << "time_s,gyro_x,gyro_y,gyro_z,acc_x,acc_y,acc_z\n";
+                    g_imu_record_start_ns = 0;
+                    g_imu_record_count = 0;
+                    g_imu_recording.store(true);
+                }
+            }
+        } else {
+            if (ImGui::Button("Stop Recording", ImVec2(150, 30))) {
+                g_imu_recording.store(false);
+                std::lock_guard<std::mutex> lock(g_imu_csv_mutex);
+                if (g_imu_csv_file.is_open()) {
+                    g_imu_csv_file.close();
+                }
+            }
+        }
+
+        ImGui::SameLine();
+        ImGui::TextDisabled("(saves to slam_gui.exe directory)");
+    }
+
+    ImGui::Spacing();
 #endif
 
     // Sensor fusion comparison
@@ -4485,6 +4592,29 @@ void DrawSettingsTab() {
 
         ImGui::Checkbox("Deskew Enabled", &g_config.deskew_enabled);
         SetTooltip("Enable motion compensation for LiDAR scans. Applied when mapping starts.");
+
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Flyaway Protection");
+
+        ImGui::SliderFloat("Max Pos Jump (m)", &g_config.max_position_jump, 0.1f, 2.0f, "%.2f");
+        SetTooltip("Reject IEKF update if position jumps more than this. 0.3m recommended for slow robots. (Requires restart)");
+
+        ImGui::SliderFloat("Max Rot Jump (deg)", &g_config.max_rotation_jump, 5.0f, 60.0f, "%.1f");
+        SetTooltip("Reject IEKF update if rotation jumps more than this. 20 deg recommended. (Requires restart)");
+
+        ImGui::SliderInt("Min Effective Pts", &g_config.min_effective_points, 10, 200);
+        SetTooltip("Minimum matched points for valid IEKF update. Below this, update is rejected. (Requires restart)");
+
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "Vibration Compensation");
+
+        if (ImGui::SliderFloat("IMU LPF Alpha", &g_config.imu_lpf_alpha, 0.0f, 0.9f, "%.2f")) {
+            // Apply immediately if SLAM is running
+            if (g_slam) {
+                g_slam->setImuLpfAlpha(g_config.imu_lpf_alpha);
+            }
+        }
+        SetTooltip("Low-pass filter for IMU vibration. 0=disabled, 0.2-0.4=moderate (fast platforms), 0.5-0.7=heavy (vibrating platforms). Lower = more filtering.");
     }
 
     ImGui::Spacing();

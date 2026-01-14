@@ -148,9 +148,17 @@ M4D getPose() const {
 | Fitness Threshold | 95% required | ✅ 90% required | ✅ FIXED |
 | Pose Jump Rejection | Implicit | ✅ Explicit 1m threshold | ✅ FIXED |
 | Fallback on Failure | Keeps old transform | ✅ Keeps old transform | ✅ FIXED |
+| SLAM Reset on Start | N/A (separate process) | ✅ reset() before startProgressiveLocalization() | ✅ FIXED |
+
+**8. Localization Startup Flyaway (RESOLVED - January 2026)**:
+   - **Problem**: Starting progressive localization caused immediate flyaway
+   - **Root Cause**: When transitioning to RELOCALIZING state, the SLAM engine was NOT reset. The ikd-tree still contained old map points from a previous mapping session, and the EKF had stale biases/position. New LiDAR scans matched against old map points, causing divergence.
+   - **Why Mapping Worked**: START_MAPPING calls `g_slam->reset()`, but RELOCALIZE did not.
+   - **Fix**: In `slam_gui.cpp` RELOCALIZE handler, call `g_slam->reset()` before `startProgressiveLocalization()`. This clears the ikd-tree and EKF state while preserving `prebuilt_map_points_`.
 
 **Key Files Changed:**
 - `slam_engine.hpp`: Transform fusion implementation, periodic ICP, pose jump detection
+- `slam_gui.cpp`: Added reset() call before startProgressiveLocalization() (line ~1682)
 
 **Reference**: Original FAST-LIO-Localization is in `C:\Users\wmuld\OneDrive\Desktop\Documents\ATLASCpp\fast_lio_localization\`
 

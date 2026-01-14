@@ -359,12 +359,14 @@ inline void ImuProcessor::undistortPointCloud(
     esekfom::esekf<state_ikfom, 12, input_ikfom>& kf_state,
     PointCloud& pcl_out) {
 
-    // Add the last IMU from previous frame to current IMU buffer
-    std::deque<ImuData> v_imu = meas.imu;
-    v_imu.push_front(last_imu_);
+    // PERFORMANCE FIX: Use member deque instead of copying meas.imu
+    // Original code copied entire deque (~20 samples) just to prepend one element
+    v_imu_.clear();
+    v_imu_.push_back(last_imu_);
+    v_imu_.insert(v_imu_.end(), meas.imu.begin(), meas.imu.end());
 
-    const double imu_beg_time = v_imu.front().timestamp_sec();
-    const double imu_end_time = v_imu.back().timestamp_sec();
+    const double imu_beg_time = v_imu_.front().timestamp_sec();
+    const double imu_end_time = v_imu_.back().timestamp_sec();
     const double pcl_beg_time = meas.lidar_beg_time;
     const double pcl_end_time = meas.lidar_end_time;
 
@@ -395,7 +397,7 @@ inline void ImuProcessor::undistortPointCloud(
     double dt = 0;
 
     input_ikfom in;
-    for (auto it = v_imu.begin(); it < v_imu.end() - 1; it++) {
+    for (auto it = v_imu_.begin(); it < v_imu_.end() - 1; it++) {
         const auto& head = *it;
         const auto& tail = *(it + 1);
 

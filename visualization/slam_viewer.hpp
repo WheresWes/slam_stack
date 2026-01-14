@@ -298,6 +298,31 @@ public:
     bool processMessages();
 
     //==========================================================================
+    // Click-to-Set-Pose (for localization initial guess)
+    //==========================================================================
+
+    /**
+     * Callback type for map click events
+     * @param world_x, world_y World coordinates of click
+     * @param heading Heading angle (radians) if right-drag was used, or NaN if just a click
+     */
+    using MapClickCallback = std::function<void(float world_x, float world_y, float heading)>;
+
+    /**
+     * Set callback for map click events
+     * When user clicks on the map, the callback receives world coordinates
+     * Right-drag allows setting heading direction
+     */
+    void setMapClickCallback(MapClickCallback callback);
+
+    /**
+     * Enable/disable click-to-pose mode
+     * When enabled, clicking on the map triggers the callback instead of camera control
+     */
+    void setClickToPoseMode(bool enabled);
+    bool isClickToPoseMode() const;
+
+    //==========================================================================
     // Camera Control
     //==========================================================================
 

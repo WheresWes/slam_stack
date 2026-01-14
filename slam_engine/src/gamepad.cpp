@@ -260,4 +260,43 @@ void Gamepad::setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
     SDL_GameControllerSetLED(impl_->controller, r, g, b);
 }
 
+int Gamepad::getBatteryLevel() const {
+    if (!impl_->controller) return -1;
+
+    // Get the underlying joystick
+    SDL_Joystick* joystick = SDL_GameControllerGetJoystick(impl_->controller);
+    if (!joystick) return -1;
+
+    SDL_JoystickPowerLevel power = SDL_JoystickCurrentPowerLevel(joystick);
+
+    switch (power) {
+        case SDL_JOYSTICK_POWER_EMPTY:  return 5;
+        case SDL_JOYSTICK_POWER_LOW:    return 20;
+        case SDL_JOYSTICK_POWER_MEDIUM: return 50;
+        case SDL_JOYSTICK_POWER_FULL:   return 100;
+        case SDL_JOYSTICK_POWER_WIRED:  return 100;
+        case SDL_JOYSTICK_POWER_MAX:    return 100;
+        default:                        return -1;  // Unknown
+    }
+}
+
+Gamepad::BatteryLevel Gamepad::getBatteryLevelEnum() const {
+    if (!impl_->controller) return BatteryLevel::UNKNOWN;
+
+    SDL_Joystick* joystick = SDL_GameControllerGetJoystick(impl_->controller);
+    if (!joystick) return BatteryLevel::UNKNOWN;
+
+    SDL_JoystickPowerLevel power = SDL_JoystickCurrentPowerLevel(joystick);
+
+    switch (power) {
+        case SDL_JOYSTICK_POWER_EMPTY:  return BatteryLevel::EMPTY;
+        case SDL_JOYSTICK_POWER_LOW:    return BatteryLevel::LOW;
+        case SDL_JOYSTICK_POWER_MEDIUM: return BatteryLevel::MEDIUM;
+        case SDL_JOYSTICK_POWER_FULL:   return BatteryLevel::FULL;
+        case SDL_JOYSTICK_POWER_WIRED:  return BatteryLevel::WIRED;
+        case SDL_JOYSTICK_POWER_MAX:    return BatteryLevel::MAX;
+        default:                        return BatteryLevel::UNKNOWN;
+    }
+}
+
 } // namespace slam

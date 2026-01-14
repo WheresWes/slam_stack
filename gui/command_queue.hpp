@@ -35,6 +35,8 @@ enum class CommandType {
     START_LOCALIZATION,
     STOP_LOCALIZATION,
     RELOCALIZE,
+    RUN_GLOBAL_LOCALIZATION,  // Run ICP when coverage is sufficient
+    CANCEL_GLOBAL_LOCALIZATION,
     SET_POSE_HINT,
 
     // Hull mesh

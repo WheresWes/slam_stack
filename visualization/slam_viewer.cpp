@@ -215,6 +215,18 @@ void SlamViewer::setRobotPose(float x, float y, float heading) {
     impl_->setRobotPose(x, y, heading);
 }
 
+void SlamViewer::setMapClickCallback(MapClickCallback callback) {
+    impl_->setMapClickCallback(std::move(callback));
+}
+
+void SlamViewer::setClickToPoseMode(bool enabled) {
+    impl_->setClickToPoseMode(enabled);
+}
+
+bool SlamViewer::isClickToPoseMode() const {
+    return impl_->isClickToPoseMode();
+}
+
 SlamViewer::RenderStats SlamViewer::getStats() const {
     return impl_->getStats();
 }
@@ -1829,16 +1841,88 @@ void SlamViewerImpl::renderWidget(float width, float height) {
     if (ImGui::IsItemHovered()) {
         ImGuiIO& io = ImGui::GetIO();
 
-        if (io.MouseDown[0]) {  // Left button - rotate
-            // Negate X so drag-left = rotate-left (conventional behavior)
-            camera_.rotate(-io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
+        // Get the image position for screen-to-world conversion
+        ImVec2 imagePos = ImGui::GetItemRectMin();
+
+        // Helper lambda to convert screen position to world XY (intersect with Z=0 plane)
+        auto screenToWorld = [&](float sx, float sy, float& wx, float& wy) -> bool {
+            // Convert to normalized device coordinates (-1 to 1)
+            float ndcX = ((sx - imagePos.x) / size.x) * 2.0f - 1.0f;
+            float ndcY = 1.0f - ((sy - imagePos.y) / size.y) * 2.0f;  // Flip Y
+
+            // Get view and projection matrices
+            float aspect = static_cast<float>(viewportWidth_) / static_cast<float>(viewportHeight_);
+            M4F view = camera_.getViewMatrix();
+            M4F proj = camera_.getProjectionMatrix(aspect, config_.camera_fov,
+                                                    config_.camera_near, config_.camera_far);
+            M4F invViewProj = (proj * view).inverse();
+
+            // Unproject near and far points
+            V4F nearPoint = invViewProj * V4F(ndcX, ndcY, 0.0f, 1.0f);
+            V4F farPoint = invViewProj * V4F(ndcX, ndcY, 1.0f, 1.0f);
+            nearPoint /= nearPoint.w();
+            farPoint /= farPoint.w();
+
+            // Ray from near to far
+            V3F rayOrigin(nearPoint.x(), nearPoint.y(), nearPoint.z());
+            V3F rayDir = (V3F(farPoint.x(), farPoint.y(), farPoint.z()) - rayOrigin).normalized();
+
+            // Intersect with Z=0 plane
+            if (std::abs(rayDir.z()) < 0.001f) return false;  // Ray parallel to ground
+            float t = -rayOrigin.z() / rayDir.z();
+            if (t < 0) return false;  // Intersection behind camera
+
+            V3F intersection = rayOrigin + rayDir * t;
+            wx = intersection.x();
+            wy = intersection.y();
+            return true;
+        };
+
+        // Click-to-pose mode handling
+        if (clickToPoseMode_ && mapClickCallback_) {
+            if (ImGui::IsMouseClicked(0)) {  // Left click - set position
+                float wx, wy;
+                if (screenToWorld(io.MousePos.x, io.MousePos.y, wx, wy)) {
+                    clickDragActive_ = true;
+                    clickStartWorldX_ = wx;
+                    clickStartWorldY_ = wy;
+                }
+            }
+            if (clickDragActive_ && ImGui::IsMouseReleased(0)) {
+                float wx, wy;
+                if (screenToWorld(io.MousePos.x, io.MousePos.y, wx, wy)) {
+                    float dx = wx - clickStartWorldX_;
+                    float dy = wy - clickStartWorldY_;
+                    float dragDist = std::sqrt(dx * dx + dy * dy);
+
+                    if (dragDist > 0.1f) {
+                        // Drag was significant - compute heading from drag direction
+                        float heading = std::atan2(dy, dx);
+                        mapClickCallback_(clickStartWorldX_, clickStartWorldY_, heading);
+                    } else {
+                        // Just a click - use NaN for heading (let system use default)
+                        mapClickCallback_(clickStartWorldX_, clickStartWorldY_, std::nanf(""));
+                    }
+                }
+                clickDragActive_ = false;
+            }
+        } else {
+            // Normal camera control mode
+            if (io.MouseDown[0]) {  // Left button - rotate
+                // Negate X so drag-left = rotate-left (conventional behavior)
+                camera_.rotate(-io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
+            }
+            if (io.MouseDown[2]) {  // Middle button - pan
+                camera_.pan(-io.MouseDelta.x, io.MouseDelta.y);
+            }
         }
-        if (io.MouseDown[2]) {  // Middle button - pan
-            camera_.pan(-io.MouseDelta.x, io.MouseDelta.y);
-        }
-        if (io.MouseWheel != 0) {  // Scroll - zoom
+
+        if (io.MouseWheel != 0) {  // Scroll - zoom (always available)
             camera_.zoom(io.MouseWheel);
         }
+    } else {
+        // Mouse left the widget area - cancel any drag
+        clickDragActive_ = false;
     }
 }
 
@@ -1996,6 +2080,15 @@ SlamViewer::RenderStats SlamViewerImpl::getStats() const {
         coverageGrid_.getCoveragePercent() * coverageGrid_.getCells().size() / 100.0f);
     stats_.total_cells = coverageGrid_.getCells().size();
     return stats_;
+}
+
+void SlamViewerImpl::setMapClickCallback(SlamViewer::MapClickCallback callback) {
+    mapClickCallback_ = std::move(callback);
+}
+
+void SlamViewerImpl::setClickToPoseMode(bool enabled) {
+    clickToPoseMode_ = enabled;
+    clickDragActive_ = false;
 }
 
 LRESULT CALLBACK SlamViewerImpl::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {

@@ -465,6 +465,35 @@ public:
      */
     LocalizationResult checkProgressiveLocalization();
 
+    /**
+     * @brief Check if ready to run global localization (coverage sufficient)
+     *
+     * When this returns true, the robot should stop and runGlobalLocalization()
+     * should be called to perform ICP alignment.
+     */
+    bool isReadyForGlobalLocalization() const {
+        if (!progressive_localization_active_) return false;
+        return progressive_localizer_.isReadyForLocalization();
+    }
+
+    /**
+     * @brief Run global localization with progress callback
+     *
+     * IMPORTANT: Robot should be STOPPED before calling this!
+     * This runs the full ICP pipeline which may take several seconds.
+     *
+     * @param progress_callback Callback for progress updates (can be nullptr)
+     * @return Localization result with transform if successful
+     */
+    LocalizationResult runGlobalLocalization(LocalizationProgressCallback progress_callback = nullptr);
+
+    /**
+     * @brief Cancel in-progress global localization
+     */
+    void cancelGlobalLocalization() {
+        progressive_localizer_.cancelLocalization();
+    }
+
     //=========================================================================
     // Callbacks
     //=========================================================================
@@ -927,8 +956,15 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
     debug_timing_.downsample_us = std::chrono::duration<double, std::micro>(ds_end - ds_start).count();
     debug_timing_.points_after_ds = feats_down_size_;
 
-    // Initialize map if needed
+    // Initialize map if needed - but ONLY after IMU is fully initialized!
+    // Building the map before IMU init completes can cause flyaway because
+    // the gravity-aligned rotation isn't properly computed yet.
     if (ikdtree_.Root_Node == nullptr) {
+        if (!imu_processor_->isInitialized()) {
+            // IMU still initializing - skip this scan
+            // (original FAST-LIO also skips scans until IMU is ready)
+            return;
+        }
         if (feats_down_size_ > 5) {
             // Reset EKF position to origin for first map
             state_ikfom reset_state = kf_.get_x();
@@ -1052,7 +1088,11 @@ inline void SlamEngine::pointBodyToWorld(const LidarPoint& pi, WorldPoint& po) c
 }
 
 inline void SlamEngine::lasermapFovSegment() {
-    V3D pos_LiD(state_point_.pos[0], state_point_.pos[1], state_point_.pos[2]);
+    // Compute LiDAR position (not IMU position) like original FAST-LIO:
+    // pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I
+    V3D imu_pos(state_point_.pos[0], state_point_.pos[1], state_point_.pos[2]);
+    V3D offset_T_L_I(state_point_.offset_T_L_I[0], state_point_.offset_T_L_I[1], state_point_.offset_T_L_I[2]);
+    V3D pos_LiD = imu_pos + state_point_.rot.toRotationMatrix() * offset_T_L_I;
 
     if (!localmap_initialized_) {
         for (int i = 0; i < 3; i++) {
@@ -1413,10 +1453,20 @@ inline M4D SlamEngine::getLocalPose() const {
 }
 
 inline V3D SlamEngine::getPosition() const {
+    // Apply transform fusion if active (consistent with getPose())
+    if (localization_mode_ && transform_initialized_) {
+        M4D corrected_pose = getPose();
+        return corrected_pose.block<3, 1>(0, 3);
+    }
     return V3D(state_point_.pos[0], state_point_.pos[1], state_point_.pos[2]);
 }
 
 inline M3D SlamEngine::getRotation() const {
+    // Apply transform fusion if active (consistent with getPose())
+    if (localization_mode_ && transform_initialized_) {
+        M4D corrected_pose = getPose();
+        return corrected_pose.block<3, 3>(0, 0);
+    }
     return state_point_.rot.toRotationMatrix();
 }
 
@@ -1820,7 +1870,7 @@ inline void SlamEngine::startProgressiveLocalization(const ProgressiveLocalizerC
     }
 
     // Configure and reset the progressive localizer
-    progressive_localizer_ = ProgressiveGlobalLocalizer(config);
+    progressive_localizer_.setConfig(config);
     progressive_localizer_.setPrebuiltMap(map_world);
     progressive_localizer_.reset();
     progressive_localization_active_ = true;
@@ -1873,6 +1923,58 @@ inline LocalizationResult SlamEngine::checkProgressiveLocalization() {
 
     // Check coverage and attempt localization
     result = progressive_localizer_.checkAndLocalize(local_map, trajectory, current_pose);
+
+    // If localization succeeded, swap to pre-built map
+    if (result.status == LocalizationStatus::SUCCESS) {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "  LOCALIZATION SUCCESSFUL!" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "Confidence: " << (result.confidence * 100) << "%" << std::endl;
+        std::cout << "Voxels: " << result.local_map_voxels << std::endl;
+        std::cout << "Rotation: " << result.rotation_deg << " deg" << std::endl;
+        std::cout << "Distance: " << result.distance_m << " m" << std::endl;
+        std::cout << "Attempts: " << result.attempt_number << std::endl;
+        std::cout << std::endl;
+
+        // Swap to pre-built map
+        swapToPrebuiltMap(result.transform);
+
+        localization_fitness_ = result.confidence;
+        progressive_localization_active_ = false;
+
+        std::cout << "========================================" << std::endl;
+        std::cout << "  NOW TRACKING IN LOCALIZATION MODE" << std::endl;
+        std::cout << "========================================\n" << std::endl;
+    }
+
+    return result;
+}
+
+inline LocalizationResult SlamEngine::runGlobalLocalization(LocalizationProgressCallback progress_callback) {
+    LocalizationResult result;
+
+    if (!progressive_localization_active_) {
+        result.status = LocalizationStatus::NOT_STARTED;
+        result.message = "Progressive localization not started";
+        return result;
+    }
+
+    if (!progressive_localizer_.isReadyForLocalization()) {
+        result.status = LocalizationStatus::ACCUMULATING;
+        result.message = "Not enough coverage yet - continue building local map";
+        return result;
+    }
+
+    // Get current FAST-LIO state
+    auto local_map = getMapPoints();
+    M4D current_pose = getPose();
+
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "  RUNNING GLOBAL LOCALIZATION" << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    // Run global localization with progress callback
+    result = progressive_localizer_.runGlobalLocalization(local_map, current_pose, progress_callback);
 
     // If localization succeeded, swap to pre-built map
     if (result.status == LocalizationStatus::SUCCESS) {

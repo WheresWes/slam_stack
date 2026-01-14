@@ -20,6 +20,8 @@
 #include <cmath>
 #include <string>
 #include <algorithm>
+#include <functional>
+#include <atomic>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
@@ -62,7 +64,8 @@ enum class LocalizationStatus {
     WAITING_IMU_INIT,     // Waiting for IMU initialization
     ACCUMULATING,         // FAST-LIO building local map
     VIEW_SATURATED,       // Current view exhausted, need to move
-    READY_TO_ATTEMPT,     // Have enough coverage, attempting localization
+    READY_FOR_LOCALIZATION, // Have enough coverage, ready to run ICP (robot should stop)
+    AWAITING_ROBOT_STOP,  // Coverage met, waiting for robot to stop before ICP
     ATTEMPTING,           // Currently running global ICP
     LOW_CONFIDENCE,       // Attempted but confidence too low
     SUCCESS,              // Localization succeeded, ready for tracking
@@ -75,7 +78,8 @@ inline const char* toString(LocalizationStatus status) {
         case LocalizationStatus::WAITING_IMU_INIT: return "WAITING_IMU_INIT";
         case LocalizationStatus::ACCUMULATING: return "ACCUMULATING";
         case LocalizationStatus::VIEW_SATURATED: return "VIEW_SATURATED";
-        case LocalizationStatus::READY_TO_ATTEMPT: return "READY_TO_ATTEMPT";
+        case LocalizationStatus::READY_FOR_LOCALIZATION: return "READY_FOR_LOCALIZATION";
+        case LocalizationStatus::AWAITING_ROBOT_STOP: return "AWAITING_ROBOT_STOP";
         case LocalizationStatus::ATTEMPTING: return "ATTEMPTING";
         case LocalizationStatus::LOW_CONFIDENCE: return "LOW_CONFIDENCE";
         case LocalizationStatus::SUCCESS: return "SUCCESS";
@@ -83,6 +87,51 @@ inline const char* toString(LocalizationStatus status) {
         default: return "UNKNOWN";
     }
 }
+
+//=============================================================================
+// Localization Progress - For UI feedback during ICP
+//=============================================================================
+
+enum class LocalizationStage {
+    IDLE,
+    GENERATING_HYPOTHESES,
+    COARSE_ICP,
+    MEDIUM_ICP,
+    FINE_ICP,
+    EVALUATING,
+    COMPLETE
+};
+
+inline const char* toString(LocalizationStage stage) {
+    switch (stage) {
+        case LocalizationStage::IDLE: return "Idle";
+        case LocalizationStage::GENERATING_HYPOTHESES: return "Generating hypotheses...";
+        case LocalizationStage::COARSE_ICP: return "Coarse alignment...";
+        case LocalizationStage::MEDIUM_ICP: return "Medium refinement...";
+        case LocalizationStage::FINE_ICP: return "Fine alignment...";
+        case LocalizationStage::EVALUATING: return "Evaluating confidence...";
+        case LocalizationStage::COMPLETE: return "Complete";
+        default: return "Unknown";
+    }
+}
+
+struct LocalizationProgress {
+    LocalizationStage stage = LocalizationStage::IDLE;
+    float progress = 0.0f;       // 0.0 to 1.0 overall progress
+    float stage_progress = 0.0f; // 0.0 to 1.0 within current stage
+    std::string message;
+
+    // ICP metrics (updated during refinement)
+    int hypotheses_count = 0;
+    int hypotheses_kept = 0;
+    double best_score = 0.0;
+    double current_fitness = 0.0;
+    int current_iteration = 0;
+    int max_iterations = 0;
+};
+
+// Progress callback type
+using LocalizationProgressCallback = std::function<void(const LocalizationProgress&)>;
 
 struct LocalizationResult {
     LocalizationStatus status = LocalizationStatus::NOT_STARTED;
@@ -379,6 +428,27 @@ public:
         : config_(config) {}
 
     /**
+     * @brief Set configuration
+     */
+    void setConfig(const ProgressiveLocalizerConfig& config) {
+        config_ = config;
+    }
+
+    /**
+     * @brief Cancel any in-progress localization attempt
+     */
+    void cancelLocalization() {
+        cancel_requested_.store(true);
+    }
+
+    /**
+     * @brief Check if cancellation was requested
+     */
+    bool isCancellationRequested() const {
+        return cancel_requested_.load();
+    }
+
+    /**
      * @brief Set the pre-built map for localization
      */
     void setPrebuiltMap(const std::vector<WorldPoint>& map_points) {
@@ -416,29 +486,33 @@ public:
     }
 
     /**
-     * @brief Check coverage and attempt localization if ready
+     * @brief Check accumulation progress WITHOUT running ICP
      *
      * Call this periodically (e.g., after each SLAM cycle) with FAST-LIO's
-     * current local map and trajectory.
+     * current local map and trajectory. This only monitors coverage and
+     * does NOT trigger global localization.
      *
      * @param local_map_points Points from FAST-LIO's ikd-tree
      * @param trajectory FAST-LIO's trajectory (all poses)
-     * @param current_pose Current FAST-LIO pose
-     * @return Localization result with status and transform if successful
+     * @return Localization result with coverage stats and readiness status
      */
-    LocalizationResult checkAndLocalize(
+    LocalizationResult checkAccumulation(
         const std::vector<WorldPoint>& local_map_points,
-        const std::vector<M4D>& trajectory,
-        const M4D& current_pose) {
+        const std::vector<M4D>& trajectory) {
 
         LocalizationResult result;
 
         if (status_ == LocalizationStatus::SUCCESS) {
             result.status = LocalizationStatus::SUCCESS;
             result.transform = best_transform_;
-            result.pose = best_transform_ * current_pose;
             result.confidence = best_confidence_;
             result.message = "Already localized";
+            return result;
+        }
+
+        if (status_ == LocalizationStatus::ATTEMPTING) {
+            result.status = LocalizationStatus::ATTEMPTING;
+            result.message = "Localization in progress...";
             return result;
         }
 
@@ -459,81 +533,14 @@ public:
             return result;
         }
 
-        // Check if ready to attempt
+        // Check if ready to attempt (but DON'T run ICP here)
         if (coverage_monitor_.isReadyForAttempt()) {
-            status_ = LocalizationStatus::ATTEMPTING;
-            attempt_count_++;
-            result.attempt_number = attempt_count_;
-
-            std::cout << "\n[ProgressiveLocalizer] Attempting global localization..."
-                      << std::endl;
-            std::cout << "  Local map: " << local_map_points.size() << " points, "
-                      << result.local_map_voxels << " voxels" << std::endl;
-            std::cout << "  Coverage: " << result.rotation_deg << " deg rotation, "
-                      << result.distance_m << " m traveled" << std::endl;
-
-            // Convert local map to V3D
-            std::vector<V3D> local_points;
-            local_points.reserve(local_map_points.size());
-            for (const auto& pt : local_map_points) {
-                local_points.emplace_back(pt.x, pt.y, pt.z);
-            }
-
-            // Run global localization
-            auto [transform, confidence] = attemptGlobalLocalization(local_points);
-
-            result.transform = transform;
-            result.confidence = confidence;
-            result.pose = transform * current_pose;
-
-            std::cout << "  Result: " << (confidence * 100) << "% confidence"
-                      << std::endl;
-
-            if (confidence >= config_.high_confidence) {
-                status_ = LocalizationStatus::SUCCESS;
-                best_transform_ = transform;
-                best_confidence_ = confidence;
-                result.status = status_;
-                result.message = "Localized with high confidence";
-                std::cout << "  >>> SUCCESS (high confidence) <<<" << std::endl;
-                return result;
-            }
-
-            if (confidence >= config_.min_confidence) {
-                // Accept with moderate confidence if we have good coverage
-                if (result.local_map_voxels >= CoverageMonitor::GOOD_VOXELS ||
-                    result.rotation_deg >= 90.0) {
-                    status_ = LocalizationStatus::SUCCESS;
-                    best_transform_ = transform;
-                    best_confidence_ = confidence;
-                    result.status = status_;
-                    result.message = "Localized (moderate confidence)";
-                    std::cout << "  >>> SUCCESS (moderate confidence) <<<" << std::endl;
-                    return result;
-                }
-            }
-
-            // Not confident enough
-            if (attempt_count_ >= config_.max_attempts) {
-                status_ = LocalizationStatus::FAILED;
-                result.status = status_;
-                result.message = "Max attempts reached - localization failed";
-                std::cout << "  >>> FAILED (max attempts) <<<" << std::endl;
-                return result;
-            }
-
-            // Keep best attempt
-            if (confidence > best_confidence_) {
-                best_transform_ = transform;
-                best_confidence_ = confidence;
-            }
-
-            status_ = LocalizationStatus::LOW_CONFIDENCE;
+            status_ = LocalizationStatus::READY_FOR_LOCALIZATION;
+            result.status = status_;
             char buf[256];
             snprintf(buf, sizeof(buf),
-                     "Attempt %d: %.0f%% confidence - continue scanning...",
-                     attempt_count_, confidence * 100);
-            result.status = status_;
+                     "Ready to localize: %d voxels, %.0f deg - STOP robot and click Localize",
+                     result.local_map_voxels, result.rotation_deg);
             result.message = std::string(buf);
             return result;
         }
@@ -545,6 +552,140 @@ public:
         return result;
     }
 
+    /**
+     * @brief Check if ready to run global localization
+     */
+    bool isReadyForLocalization() const {
+        return status_ == LocalizationStatus::READY_FOR_LOCALIZATION ||
+               status_ == LocalizationStatus::LOW_CONFIDENCE;
+    }
+
+    /**
+     * @brief Run global localization (should be called with robot STOPPED)
+     *
+     * This runs the full ICP pipeline with progress reporting.
+     * IMPORTANT: Robot should be stationary when calling this!
+     *
+     * @param local_map_points Points from FAST-LIO's ikd-tree
+     * @param current_pose Current FAST-LIO pose
+     * @param progress_callback Callback for progress updates
+     * @return Localization result with transform if successful
+     */
+    LocalizationResult runGlobalLocalization(
+        const std::vector<WorldPoint>& local_map_points,
+        const M4D& current_pose,
+        LocalizationProgressCallback progress_callback = nullptr) {
+
+        LocalizationResult result;
+        cancel_requested_.store(false);
+
+        result.local_map_voxels = coverage_monitor_.getVoxelCount();
+        result.rotation_deg = coverage_monitor_.getRotationDeg();
+        result.distance_m = coverage_monitor_.getDistanceM();
+        result.local_map_points = static_cast<int>(local_map_points.size());
+
+        status_ = LocalizationStatus::ATTEMPTING;
+        attempt_count_++;
+        result.attempt_number = attempt_count_;
+
+        std::cout << "\n[ProgressiveLocalizer] Running global localization..."
+                  << std::endl;
+        std::cout << "  Local map: " << local_map_points.size() << " points, "
+                  << result.local_map_voxels << " voxels" << std::endl;
+        std::cout << "  Coverage: " << result.rotation_deg << " deg rotation, "
+                  << result.distance_m << " m traveled" << std::endl;
+
+        // Convert local map to V3D
+        std::vector<V3D> local_points;
+        local_points.reserve(local_map_points.size());
+        for (const auto& pt : local_map_points) {
+            local_points.emplace_back(pt.x, pt.y, pt.z);
+        }
+
+        // Run global localization with progress
+        auto [transform, confidence] = attemptGlobalLocalizationWithProgress(
+            local_points, progress_callback);
+
+        // Check for cancellation
+        if (cancel_requested_.load()) {
+            status_ = LocalizationStatus::READY_FOR_LOCALIZATION;
+            result.status = status_;
+            result.message = "Localization cancelled";
+            return result;
+        }
+
+        result.transform = transform;
+        result.confidence = confidence;
+        result.pose = transform * current_pose;
+
+        std::cout << "  Result: " << (confidence * 100) << "% confidence"
+                  << std::endl;
+
+        if (confidence >= config_.high_confidence) {
+            status_ = LocalizationStatus::SUCCESS;
+            best_transform_ = transform;
+            best_confidence_ = confidence;
+            result.status = status_;
+            result.message = "Localized with high confidence";
+            std::cout << "  >>> SUCCESS (high confidence) <<<" << std::endl;
+            return result;
+        }
+
+        if (confidence >= config_.min_confidence) {
+            // Accept with moderate confidence if we have good coverage
+            if (result.local_map_voxels >= CoverageMonitor::GOOD_VOXELS ||
+                result.rotation_deg >= 90.0) {
+                status_ = LocalizationStatus::SUCCESS;
+                best_transform_ = transform;
+                best_confidence_ = confidence;
+                result.status = status_;
+                result.message = "Localized (moderate confidence)";
+                std::cout << "  >>> SUCCESS (moderate confidence) <<<" << std::endl;
+                return result;
+            }
+        }
+
+        // Not confident enough
+        if (attempt_count_ >= config_.max_attempts) {
+            status_ = LocalizationStatus::FAILED;
+            result.status = status_;
+            result.message = "Max attempts reached - localization failed";
+            std::cout << "  >>> FAILED (max attempts) <<<" << std::endl;
+            return result;
+        }
+
+        // Keep best attempt
+        if (confidence > best_confidence_) {
+            best_transform_ = transform;
+            best_confidence_ = confidence;
+        }
+
+        status_ = LocalizationStatus::LOW_CONFIDENCE;
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "Attempt %d: %.0f%% confidence - try again or move robot",
+                 attempt_count_, confidence * 100);
+        result.status = status_;
+        result.message = std::string(buf);
+        return result;
+    }
+
+    /**
+     * @brief Legacy method - same as checkAccumulation
+     * @deprecated Use checkAccumulation() instead
+     */
+    LocalizationResult checkAndLocalize(
+        const std::vector<WorldPoint>& local_map_points,
+        const std::vector<M4D>& trajectory,
+        const M4D& current_pose) {
+        // Just check accumulation - don't auto-run ICP
+        auto result = checkAccumulation(local_map_points, trajectory);
+        if (result.status == LocalizationStatus::SUCCESS) {
+            result.pose = best_transform_ * current_pose;
+        }
+        return result;
+    }
+
     LocalizationStatus getStatus() const { return status_; }
     const CoverageMonitor& getCoverageMonitor() const { return coverage_monitor_; }
     M4D getBestTransform() const { return best_transform_; }
@@ -553,12 +694,51 @@ public:
 
 private:
     /**
-     * @brief Run global localization: find transform from local map to pre-built map
+     * @brief Helper to report progress
      */
-    std::pair<M4D, double> attemptGlobalLocalization(const std::vector<V3D>& local_map) {
+    void reportProgress(LocalizationProgressCallback callback,
+                       LocalizationStage stage, float progress,
+                       float stage_progress, const std::string& message,
+                       int hypotheses = 0, int kept = 0,
+                       double best_score = 0.0, double fitness = 0.0,
+                       int iter = 0, int max_iter = 0) {
+        if (!callback) return;
+
+        LocalizationProgress p;
+        p.stage = stage;
+        p.progress = progress;
+        p.stage_progress = stage_progress;
+        p.message = message;
+        p.hypotheses_count = hypotheses;
+        p.hypotheses_kept = kept;
+        p.best_score = best_score;
+        p.current_fitness = fitness;
+        p.current_iteration = iter;
+        p.max_iterations = max_iter;
+        callback(p);
+    }
+
+    /**
+     * @brief Run global localization with progress reporting
+     */
+    std::pair<M4D, double> attemptGlobalLocalizationWithProgress(
+        const std::vector<V3D>& local_map,
+        LocalizationProgressCallback callback) {
+
         if (local_map.empty() || prebuilt_map_points_.empty()) {
             return {M4D::Identity(), 0.0};
         }
+
+        // Progress breakdown:
+        // Hypothesis generation: 0-20%
+        // Coarse ICP: 20-45%
+        // Medium ICP: 45-70%
+        // Fine ICP: 70-95%
+        // Evaluation: 95-100%
+
+        // === Stage 1: Generate hypotheses (0-20%) ===
+        reportProgress(callback, LocalizationStage::GENERATING_HYPOTHESES,
+                      0.0f, 0.0f, "Generating hypotheses...");
 
         // Downsample for hypothesis generation
         auto local_coarse = voxelDownsample(local_map, config_.coarse_voxel);
@@ -576,8 +756,21 @@ private:
             (prebuilt_min_.z() + prebuilt_max_.z()) * 0.5 :
             config_.z_value;
 
+        // Count total hypotheses for progress
+        double x_range = prebuilt_max_.x() - prebuilt_min_.x();
+        double y_range = prebuilt_max_.y() - prebuilt_min_.y();
+        int x_steps = static_cast<int>(std::ceil(x_range / config_.grid_step)) + 1;
+        int y_steps = static_cast<int>(std::ceil(y_range / config_.grid_step)) + 1;
+        int total_hypotheses = x_steps * y_steps * num_yaws;
+        int processed_hypotheses = 0;
+
         // Grid search over pre-built map bounds
         for (double x = prebuilt_min_.x(); x <= prebuilt_max_.x(); x += config_.grid_step) {
+            // Check for cancellation
+            if (cancel_requested_.load()) {
+                return {M4D::Identity(), 0.0};
+            }
+
             for (double y = prebuilt_min_.y(); y <= prebuilt_max_.y(); y += config_.grid_step) {
                 for (int yi = 0; yi < num_yaws; yi++) {
                     double yaw = yi * yaw_step;
@@ -595,14 +788,28 @@ private:
                     if (score > 0.1) {  // Only keep plausible hypotheses
                         hypotheses.emplace_back(pose, score);
                     }
+
+                    processed_hypotheses++;
                 }
             }
+
+            // Update progress
+            float stage_prog = static_cast<float>(processed_hypotheses) / total_hypotheses;
+            float overall_prog = stage_prog * 0.20f;
+            char buf[128];
+            snprintf(buf, sizeof(buf), "Generating hypotheses: %d/%d tested, %zu kept",
+                    processed_hypotheses, total_hypotheses, hypotheses.size());
+            reportProgress(callback, LocalizationStage::GENERATING_HYPOTHESES,
+                          overall_prog, stage_prog, buf,
+                          total_hypotheses, static_cast<int>(hypotheses.size()));
         }
 
         std::cout << " " << hypotheses.size() << " candidates" << std::endl;
 
         if (hypotheses.empty()) {
             std::cout << "  No plausible hypotheses found!" << std::endl;
+            reportProgress(callback, LocalizationStage::COMPLETE,
+                          1.0f, 1.0f, "No plausible hypotheses found!");
             return {M4D::Identity(), 0.0};
         }
 
@@ -615,9 +822,17 @@ private:
 
         // Refine top hypothesis with coarse-to-fine ICP
         M4D best_pose = hypotheses[0].first;
+        double best_hyp_score = hypotheses[0].second;
 
-        // Coarse ICP
+        // === Stage 2: Coarse ICP (20-45%) ===
+        if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+
         std::cout << "  Coarse ICP..." << std::flush;
+        reportProgress(callback, LocalizationStage::COARSE_ICP,
+                      0.20f, 0.0f, "Starting coarse alignment...",
+                      total_hypotheses, static_cast<int>(hypotheses.size()),
+                      best_hyp_score);
+        double coarse_fitness = 0.0;
         {
             auto scan_down = voxelDownsample(local_map, config_.coarse_voxel);
             auto map_down = voxelDownsample(prebuilt_map_points_, config_.coarse_voxel);
@@ -628,13 +843,38 @@ private:
             cfg.convergence_threshold = 1e-4;
 
             ICP icp(cfg);
-            auto result = icp.align(scan_down, map_down, best_pose);
-            best_pose = result.transformation;
-            std::cout << " fitness=" << (result.fitness_score * 100) << "%" << std::endl;
+            // Run ICP with iteration tracking
+            for (int i = 0; i < cfg.max_iterations; i++) {
+                if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+
+                auto result = icp.alignOneIteration(scan_down, map_down, best_pose);
+                best_pose = result.transformation;
+                coarse_fitness = result.fitness_score;
+
+                float stage_prog = static_cast<float>(i + 1) / cfg.max_iterations;
+                float overall_prog = 0.20f + stage_prog * 0.25f;
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Coarse ICP: iteration %d/%d (%.1f%% fitness)",
+                        i + 1, cfg.max_iterations, coarse_fitness * 100);
+                reportProgress(callback, LocalizationStage::COARSE_ICP,
+                              overall_prog, stage_prog, buf,
+                              total_hypotheses, static_cast<int>(hypotheses.size()),
+                              best_hyp_score, coarse_fitness, i + 1, cfg.max_iterations);
+
+                if (result.converged) break;
+            }
+            std::cout << " fitness=" << (coarse_fitness * 100) << "%" << std::endl;
         }
 
-        // Medium ICP
+        // === Stage 3: Medium ICP (45-70%) ===
+        if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+
         std::cout << "  Medium ICP..." << std::flush;
+        reportProgress(callback, LocalizationStage::MEDIUM_ICP,
+                      0.45f, 0.0f, "Starting medium refinement...",
+                      total_hypotheses, static_cast<int>(hypotheses.size()),
+                      best_hyp_score, coarse_fitness);
+        double medium_fitness = 0.0;
         {
             auto scan_down = voxelDownsample(local_map, config_.medium_voxel);
             auto map_down = voxelDownsample(prebuilt_map_points_, config_.medium_voxel);
@@ -645,13 +885,36 @@ private:
             cfg.convergence_threshold = 1e-5;
 
             ICP icp(cfg);
-            auto result = icp.align(scan_down, map_down, best_pose);
-            best_pose = result.transformation;
-            std::cout << " fitness=" << (result.fitness_score * 100) << "%" << std::endl;
+            for (int i = 0; i < cfg.max_iterations; i++) {
+                if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+
+                auto result = icp.alignOneIteration(scan_down, map_down, best_pose);
+                best_pose = result.transformation;
+                medium_fitness = result.fitness_score;
+
+                float stage_prog = static_cast<float>(i + 1) / cfg.max_iterations;
+                float overall_prog = 0.45f + stage_prog * 0.25f;
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Medium ICP: iteration %d/%d (%.1f%% fitness)",
+                        i + 1, cfg.max_iterations, medium_fitness * 100);
+                reportProgress(callback, LocalizationStage::MEDIUM_ICP,
+                              overall_prog, stage_prog, buf,
+                              total_hypotheses, static_cast<int>(hypotheses.size()),
+                              best_hyp_score, medium_fitness, i + 1, cfg.max_iterations);
+
+                if (result.converged) break;
+            }
+            std::cout << " fitness=" << (medium_fitness * 100) << "%" << std::endl;
         }
 
-        // Fine ICP
+        // === Stage 4: Fine ICP (70-95%) ===
+        if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+
         std::cout << "  Fine ICP..." << std::flush;
+        reportProgress(callback, LocalizationStage::FINE_ICP,
+                      0.70f, 0.0f, "Starting fine alignment...",
+                      total_hypotheses, static_cast<int>(hypotheses.size()),
+                      best_hyp_score, medium_fitness);
         double final_confidence;
         {
             auto scan_down = voxelDownsample(local_map, config_.fine_voxel);
@@ -663,13 +926,49 @@ private:
             cfg.convergence_threshold = 1e-6;
 
             ICP icp(cfg);
-            auto result = icp.align(scan_down, map_down, best_pose);
-            best_pose = result.transformation;
-            final_confidence = result.fitness_score;
-            std::cout << " fitness=" << (result.fitness_score * 100) << "%" << std::endl;
+            for (int i = 0; i < cfg.max_iterations; i++) {
+                if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+
+                auto result = icp.alignOneIteration(scan_down, map_down, best_pose);
+                best_pose = result.transformation;
+                final_confidence = result.fitness_score;
+
+                float stage_prog = static_cast<float>(i + 1) / cfg.max_iterations;
+                float overall_prog = 0.70f + stage_prog * 0.25f;
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Fine ICP: iteration %d/%d (%.1f%% fitness)",
+                        i + 1, cfg.max_iterations, final_confidence * 100);
+                reportProgress(callback, LocalizationStage::FINE_ICP,
+                              overall_prog, stage_prog, buf,
+                              total_hypotheses, static_cast<int>(hypotheses.size()),
+                              best_hyp_score, final_confidence, i + 1, cfg.max_iterations);
+
+                if (result.converged) break;
+            }
+            std::cout << " fitness=" << (final_confidence * 100) << "%" << std::endl;
         }
 
+        // === Stage 5: Evaluation (95-100%) ===
+        reportProgress(callback, LocalizationStage::EVALUATING,
+                      0.95f, 0.0f, "Evaluating result...",
+                      total_hypotheses, static_cast<int>(hypotheses.size()),
+                      best_hyp_score, final_confidence);
+
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Complete: %.1f%% confidence", final_confidence * 100);
+        reportProgress(callback, LocalizationStage::COMPLETE,
+                      1.0f, 1.0f, buf,
+                      total_hypotheses, static_cast<int>(hypotheses.size()),
+                      best_hyp_score, final_confidence);
+
         return {best_pose, final_confidence};
+    }
+
+    /**
+     * @brief Run global localization (legacy, no progress)
+     */
+    std::pair<M4D, double> attemptGlobalLocalization(const std::vector<V3D>& local_map) {
+        return attemptGlobalLocalizationWithProgress(local_map, nullptr);
     }
 
     ProgressiveLocalizerConfig config_;
@@ -682,6 +981,7 @@ private:
     int attempt_count_ = 0;
     M4D best_transform_ = M4D::Identity();
     double best_confidence_ = 0.0;
+    std::atomic<bool> cancel_requested_{false};
 };
 
 } // namespace slam

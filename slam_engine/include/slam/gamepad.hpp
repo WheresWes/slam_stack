@@ -119,6 +119,24 @@ public:
     // LED color (PS5 DualSense only, 0-255 each)
     void setLEDColor(uint8_t r, uint8_t g, uint8_t b);
 
+    // Battery level (-1 = unknown, 0-100 = percentage)
+    // Note: Not all controllers report battery level
+    int getBatteryLevel() const;
+
+    // Battery level enum (from SDL)
+    enum class BatteryLevel {
+        UNKNOWN = -1,
+        EMPTY = 0,
+        LOW = 25,
+        MEDIUM = 50,
+        FULL = 100,
+        WIRED = 100,  // Wired = effectively full
+        MAX = 100
+    };
+
+    // Get battery level as enum (more reliable than percentage)
+    BatteryLevel getBatteryLevelEnum() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

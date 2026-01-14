@@ -44,6 +44,7 @@
 #include "shared_state.hpp"
 #include "command_queue.hpp"
 #include "probe_coverage.hpp"
+#include "diagnostic_logger.hpp"
 
 // Hardware drivers
 #define ENABLE_HARDWARE 1  // Set to 0 for simulation mode
@@ -108,10 +109,12 @@ struct AppConfig {
     // SLAM parameters
     float voxel_size = 0.2f;
     float blind_distance = 0.5f;
-    int max_iterations = 3;
+    int max_iterations = 2;       // Reduced from 3 for real-time
     float gyr_cov = 0.1f;
     bool deskew_enabled = true;
-    int point_filter = 3;  // Keep every Nth point (1=all, 3=keep 1/3)
+    int point_filter = 3;         // Keep every Nth point (1=all, 3=keep 1/3)
+    int max_points_icp = 2000;    // CRITICAL: Limit points in IEKF matching (0=unlimited)
+    int max_map_points = 500000;  // Max map points to prevent ikd-tree slowdown (0=unlimited)
 
     // Fusion parameters
     float slam_alpha_pos = 0.60f;
@@ -147,7 +150,13 @@ struct AppConfig {
     float viewer_lod_distance = 20.0f;
     int viewer_max_points = 5000000;  // Max visible points
     float viewer_min_zoom = 0.5f;     // Minimum camera distance (close zoom)
+
+    // Performance settings
+    bool operate_show_map = false;        // Show map points in operate tab (CPU intensive!)
+    bool operate_show_scan = false;       // Show current scan in operate tab (CPU intensive!)
+    int operate_max_points = 10000;       // Max points to render in operate tab
     float viewer_max_zoom = 500.0f;   // Maximum camera distance (far zoom)
+    bool disable_map_viewer = false;      // Disable map viewer updates entirely (for performance testing)
 };
 
 //==============================================================================
@@ -160,6 +169,7 @@ static HullCoverage g_hull;
 
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_e_stop{false};
+static std::atomic<bool> g_calibration_cancel{false};  // Direct cancel flag (bypasses command queue)
 static std::thread g_worker_thread;
 static std::thread g_control_thread;  // High-priority motor control thread
 static HWND g_hwnd = nullptr;  // Main window handle for focus checking
@@ -175,6 +185,7 @@ static std::atomic<bool> g_hardware_initialized{false};
 #if ENABLE_HARDWARE
 static std::unique_ptr<slam::LivoxMid360> g_lidar;
 static std::unique_ptr<slam::VescDriver> g_vesc;
+static std::mutex g_vesc_mutex;  // Protects g_vesc lifecycle operations (init/shutdown)
 static std::unique_ptr<slam::SlamEngine> g_slam;
 static std::unique_ptr<slam::SensorFusion> g_fusion;
 static std::unique_ptr<slam::MotionController> g_motion;
@@ -221,6 +232,96 @@ static std::vector<std::string> g_available_maps;
 static auto g_start_time = std::chrono::steady_clock::now();
 static float g_current_time = 0.0f;
 
+// Performance metrics
+struct PerformanceMetrics {
+    std::atomic<float> slam_rate_hz{0.0f};       // SLAM updates per second
+    std::atomic<float> slam_time_ms{0.0f};       // Time per SLAM update
+    std::atomic<float> imu_rate_hz{0.0f};        // IMU samples per second
+    std::atomic<float> point_rate_hz{0.0f};      // Points per second
+    std::atomic<int> map_points{0};              // Total map points
+    std::atomic<int> scan_points{0};             // Points in current scan
+    std::atomic<int> buffer_imu{0};              // IMU samples in buffer
+    std::atomic<int> buffer_scans{0};            // Scans waiting to process
+    std::atomic<float> cpu_usage{0.0f};          // Estimated CPU usage (0-100)
+
+    // Rolling averages
+    float slam_times[60] = {0};
+    int slam_time_idx = 0;
+    std::chrono::steady_clock::time_point last_slam_time;
+    int slam_count_window = 0;
+    std::chrono::steady_clock::time_point window_start;
+
+    void recordSlamUpdate(float time_ms) {
+        slam_time_ms.store(time_ms);
+        slam_times[slam_time_idx++ % 60] = time_ms;
+        slam_count_window++;
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration<float>(now - window_start).count();
+        if (elapsed >= 1.0f) {
+            slam_rate_hz.store(slam_count_window / elapsed);
+            slam_count_window = 0;
+            window_start = now;
+        }
+    }
+
+    float getAvgSlamTime() const {
+        float sum = 0;
+        for (int i = 0; i < 60; i++) sum += slam_times[i];
+        return sum / 60.0f;
+    }
+};
+static PerformanceMetrics g_perf;
+
+//==============================================================================
+// Diagnostic Logger - Comprehensive logging for debugging
+//==============================================================================
+static DiagnosticLogger g_diag_logger;
+static bool g_logging_enabled = false;
+static char g_log_session_name[64] = "slam_session";
+
+//==============================================================================
+// System Log - Captures errors, warnings, and info messages
+//==============================================================================
+enum class LogLevel { INFO, WARNING, ERROR_LEVEL };
+
+struct LogEntry {
+    std::chrono::system_clock::time_point timestamp;
+    LogLevel level;
+    std::string source;     // e.g., "LiDAR", "VESC", "SLAM"
+    std::string message;
+};
+
+static std::mutex g_log_mutex;
+static std::vector<LogEntry> g_system_log;
+static const size_t MAX_LOG_ENTRIES = 500;  // Keep last 500 entries
+static bool g_show_system_log = false;
+
+void AddLogEntry(LogLevel level, const std::string& source, const std::string& message) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    LogEntry entry;
+    entry.timestamp = std::chrono::system_clock::now();
+    entry.level = level;
+    entry.source = source;
+    entry.message = message;
+    g_system_log.push_back(entry);
+
+    // Keep log size bounded
+    if (g_system_log.size() > MAX_LOG_ENTRIES) {
+        g_system_log.erase(g_system_log.begin());
+    }
+
+    // Also print to console
+    const char* level_str = (level == LogLevel::ERROR_LEVEL) ? "ERROR" :
+                            (level == LogLevel::WARNING) ? "WARN" : "INFO";
+    std::cout << "[" << level_str << "][" << source << "] " << message << std::endl;
+}
+
+// Convenience macros
+#define LOG_INFO(src, msg)  AddLogEntry(LogLevel::INFO, src, msg)
+#define LOG_WARN(src, msg)  AddLogEntry(LogLevel::WARNING, src, msg)
+#define LOG_ERROR(src, msg) AddLogEntry(LogLevel::ERROR_LEVEL, src, msg)
+
 //==============================================================================
 // Helper: Tooltip
 //==============================================================================
@@ -260,6 +361,8 @@ bool SaveSettings() {
     f << "voxel_size=" << g_config.voxel_size << "\n";
     f << "blind_distance=" << g_config.blind_distance << "\n";
     f << "max_iterations=" << g_config.max_iterations << "\n";
+    f << "max_points_icp=" << g_config.max_points_icp << "\n";
+    f << "max_map_points=" << g_config.max_map_points << "\n";
     f << "gyr_cov=" << g_config.gyr_cov << "\n";
     f << "deskew_enabled=" << (g_config.deskew_enabled ? 1 : 0) << "\n";
     f << "point_filter=" << g_config.point_filter << "\n";
@@ -316,6 +419,8 @@ bool LoadSettings() {
         else if (key == "voxel_size") g_config.voxel_size = std::stof(value);
         else if (key == "blind_distance") g_config.blind_distance = std::stof(value);
         else if (key == "max_iterations") g_config.max_iterations = std::stoi(value);
+        else if (key == "max_points_icp") g_config.max_points_icp = std::stoi(value);
+        else if (key == "max_map_points") g_config.max_map_points = std::stoi(value);
         else if (key == "gyr_cov") g_config.gyr_cov = std::stof(value);
         else if (key == "deskew_enabled") g_config.deskew_enabled = (std::stoi(value) != 0);
         else if (key == "point_filter") g_config.point_filter = std::stoi(value);
@@ -567,6 +672,17 @@ void OnIMU(const slam::LivoxIMUFrame& frame) {
     imu.gyro = frame.gyro;                       // Already in rad/s
     imu.acc = frame.accel * G_M_S2;              // Convert g-units to m/s²
     g_imu_queue.push_back(imu);
+
+    // Log IMU sample (downsampling handled by logger)
+    if (g_diag_logger.isRunning()) {
+        float gravity_mag = static_cast<float>(imu.acc.norm());
+        bool imu_init = g_slam ? g_slam->isInitialized() : false;
+        g_diag_logger.logImu(
+            static_cast<float>(imu.acc.x()), static_cast<float>(imu.acc.y()), static_cast<float>(imu.acc.z()),
+            static_cast<float>(imu.gyro.x()), static_cast<float>(imu.gyro.y()), static_cast<float>(imu.gyro.z()),
+            gravity_mag, imu_init);
+    }
+
     // Keep buffer bounded
     if (g_imu_queue.size() > 100) {
         g_imu_queue.erase(g_imu_queue.begin(), g_imu_queue.begin() + 50);
@@ -611,12 +727,25 @@ void UpdateSlamState() {
     gui_slam_pose.pitch = slam_pose.pitch;
     gui_slam_pose.yaw = slam_pose.yaw;
     g_shared.setSlamPose(gui_slam_pose);
+
+    // Log SLAM pose for diagnostics
+    if (g_diag_logger.isRunning()) {
+        g_diag_logger.logSlamPose(
+            slam_pose.x, slam_pose.y, slam_pose.z,
+            slam_pose.roll, slam_pose.pitch, slam_pose.yaw,
+            0.0f, 0.0f, 0.0f,  // Velocity (not available here)
+            0.0f, 0.0f, 0.0f,  // Angular velocity
+            true);  // Valid
+    }
 }
 
 // Helper: Update map points for 3D visualization
 // Called periodically (not every frame) to avoid performance issues
 void UpdateMapPointsForVisualization() {
     if (!g_slam || !g_slam->isInitialized()) return;
+
+    // Skip entirely if viewer is disabled (for performance testing)
+    if (g_config.disable_map_viewer) return;
 
     static auto last_update = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
@@ -768,6 +897,261 @@ void UpdateMotorStatus() {
 
     g_shared.setMotorStatus(0, gui_l);
     g_shared.setMotorStatus(1, gui_r);
+
+    // Log VESC status for diagnostics
+    if (g_diag_logger.isRunning()) {
+        g_diag_logger.logVescStatus(0, gui_l.erpm, gui_l.duty,
+            gui_l.current_motor, gui_l.current_input,
+            gui_l.temp_fet, gui_l.temp_motor, gui_l.voltage_in,
+            gui_l.tachometer, gui_l.connected);
+        g_diag_logger.logVescStatus(1, gui_r.erpm, gui_r.duty,
+            gui_r.current_motor, gui_r.current_input,
+            gui_r.temp_fet, gui_r.temp_motor, gui_r.voltage_in,
+            gui_r.tachometer, gui_r.connected);
+    }
+}
+
+// Helper: Check and attempt VESC reconnection
+static std::chrono::steady_clock::time_point g_last_vesc_reconnect_attempt;
+static bool g_vesc_was_connected = false;
+static bool g_show_vesc_diagnostics = false;
+static std::string g_vesc_diag_log;
+static bool g_vesc_diag_running = false;
+
+// VESC single-thread architecture: ControlThread owns all VESC operations
+// Other threads request operations via flags and read cached results
+static std::atomic<bool> g_vesc_diag_requested{false};  // Main thread sets, ControlThread processes
+static std::mutex g_vesc_cache_mutex;  // Protects cached odometry/status
+static slam::VescOdometry g_vesc_odom_cache;  // Updated by ControlThread
+static slam::VescStatus g_vesc_status_left_cache;
+static slam::VescStatus g_vesc_status_right_cache;
+static std::chrono::steady_clock::time_point g_vesc_cache_time;
+
+// LiDAR reconnect and diagnostics
+static std::chrono::steady_clock::time_point g_last_lidar_reconnect_attempt;
+static bool g_lidar_was_connected = false;
+static bool g_show_lidar_diagnostics = false;
+static std::string g_lidar_diag_log;
+static bool g_lidar_diag_running = false;
+
+void CheckVescReconnect() {
+    if (!g_vesc) return;
+
+    bool connected = g_vesc->isConnected();
+
+    // If we just lost connection, log it
+    if (g_vesc_was_connected && !connected) {
+        g_shared.setStatusMessage("VESC connection lost - will retry...");
+        LOG_WARN("VESC", "Connection lost - will attempt reconnection");
+    }
+
+    // If disconnected, try to reconnect periodically (every 3 seconds)
+    if (!connected) {
+        auto now = std::chrono::steady_clock::now();
+        float elapsed = std::chrono::duration<float>(now - g_last_vesc_reconnect_attempt).count();
+
+        if (elapsed >= 3.0f) {
+            g_last_vesc_reconnect_attempt = now;
+
+            // Try to reinitialize - use mutex to prevent race with diagnostics
+            std::unique_lock<std::mutex> lock(g_vesc_mutex, std::try_to_lock);
+            if (!lock.owns_lock()) {
+                // Another thread is doing VESC operations, skip this attempt
+                return;
+            }
+
+            g_vesc->shutdown();
+            if (g_vesc->init(g_config.can_port, g_config.vesc_left_id, g_config.vesc_right_id)) {
+                g_shared.setStatusMessage("VESC reconnected!");
+                LOG_INFO("VESC", "Reconnected on " + std::string(g_config.can_port));
+
+                // Also reinit motion controller with new VESC instance
+                if (g_motion) {
+                    g_motion->init(g_vesc.get(), g_config.calibration_file);
+                }
+            }
+        }
+    }
+
+    g_vesc_was_connected = connected;
+}
+
+// Helper: Update cached VESC odometry/status for other threads to read
+// Called from ControlThread at 50Hz - avoids other threads accessing g_vesc directly
+void UpdateVescCache() {
+    if (!g_vesc || !g_vesc->isConnected()) return;
+
+    slam::VescOdometry odom = g_vesc->getOdometry();
+    slam::VescStatus left = g_vesc->getStatus(g_config.vesc_left_id);
+    slam::VescStatus right = g_vesc->getStatus(g_config.vesc_right_id);
+
+    std::lock_guard<std::mutex> lock(g_vesc_cache_mutex);
+    g_vesc_odom_cache = odom;
+    g_vesc_status_left_cache = left;
+    g_vesc_status_right_cache = right;
+    g_vesc_cache_time = std::chrono::steady_clock::now();
+}
+
+// Helper: Process VESC diagnostics request from main thread
+// Called from ControlThread - all VESC lifecycle operations happen in this thread
+void ProcessVescDiagnostics() {
+    if (!g_vesc_diag_requested.load()) return;
+
+    g_vesc_diag_running = true;
+    g_vesc_diag_log.clear();
+    g_vesc_diag_log += "=== VESC Diagnostics ===\n\n";
+
+    // Check if COM port exists
+    std::string full_port = "\\\\.\\" + std::string(g_config.can_port);
+    HANDLE test_handle = CreateFileA(full_port.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                      0, NULL, OPEN_EXISTING, 0, NULL);
+    if (test_handle == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        g_vesc_diag_log += "[FAIL] Cannot open " + std::string(g_config.can_port);
+        if (err == 2) {
+            g_vesc_diag_log += " (port does not exist)\n";
+            g_vesc_diag_log += "  -> Check if CANable is plugged in\n";
+            g_vesc_diag_log += "  -> Check Device Manager for correct COM port\n";
+        } else if (err == 5) {
+            g_vesc_diag_log += " (access denied)\n";
+            g_vesc_diag_log += "  -> Another program may be using the port\n";
+            g_vesc_diag_log += "  -> Close VESC Tool, serial monitors, etc.\n";
+        } else {
+            g_vesc_diag_log += " (error " + std::to_string(err) + ")\n";
+            g_vesc_diag_log += "  -> Try unplugging and replugging CANable\n";
+        }
+    } else {
+        CloseHandle(test_handle);
+        g_vesc_diag_log += "[OK] " + std::string(g_config.can_port) + " is accessible\n\n";
+
+        // Try to initialize VESC
+        g_vesc_diag_log += "Attempting VESC initialization...\n";
+        if (g_vesc) {
+            g_vesc->shutdown();
+        } else {
+            g_vesc = std::make_unique<slam::VescDriver>();
+        }
+
+        if (g_vesc->init(g_config.can_port, g_config.vesc_left_id, g_config.vesc_right_id)) {
+            g_vesc_diag_log += "[OK] VESC initialized successfully!\n";
+            g_vesc_diag_log += "  -> Waiting for status messages...\n\n";
+
+            // Wait a bit for status messages
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+            auto left_status = g_vesc->getStatus(g_config.vesc_left_id);
+            auto right_status = g_vesc->getStatus(g_config.vesc_right_id);
+            bool got_left = left_status.erpm != 0 || left_status.voltage > 0;
+            bool got_right = right_status.erpm != 0 || right_status.voltage > 0;
+
+            if (got_left) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "[OK] Left VESC (ID %d): %.1fV\n",
+                         g_config.vesc_left_id, left_status.voltage);
+                g_vesc_diag_log += buf;
+            } else {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "[WARN] No response from Left VESC (ID %d)\n",
+                         g_config.vesc_left_id);
+                g_vesc_diag_log += buf;
+                g_vesc_diag_log += "  -> Check CAN wiring to left motor\n";
+                g_vesc_diag_log += "  -> Verify VESC ID in VESC Tool\n";
+            }
+
+            if (got_right) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "[OK] Right VESC (ID %d): %.1fV\n",
+                         g_config.vesc_right_id, right_status.voltage);
+                g_vesc_diag_log += buf;
+            } else {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "[WARN] No response from Right VESC (ID %d)\n",
+                         g_config.vesc_right_id);
+                g_vesc_diag_log += buf;
+                g_vesc_diag_log += "  -> Check CAN wiring to right motor\n";
+                g_vesc_diag_log += "  -> Verify VESC ID in VESC Tool\n";
+            }
+
+            if (!got_left && !got_right) {
+                g_vesc_diag_log += "\n[FAIL] No VESC responses received\n";
+                g_vesc_diag_log += "  -> Check battery power to VESCs\n";
+                g_vesc_diag_log += "  -> Enable CAN Status Messages in VESC Tool:\n";
+                g_vesc_diag_log += "     App Settings > General > CAN Status Rate = 50Hz\n";
+            } else if (got_left && got_right) {
+                g_vesc_diag_log += "\n[SUCCESS] Both VESCs responding!\n";
+                // Re-init motion controller
+                if (g_motion) {
+                    g_motion->init(g_vesc.get(), g_config.calibration_file);
+                }
+            }
+        } else {
+            g_vesc_diag_log += "[FAIL] VESC initialization failed\n";
+            g_vesc_diag_log += "  -> SLCAN handshake failed\n";
+            g_vesc_diag_log += "  -> Try unplugging and replugging CANable\n";
+        }
+    }
+
+    g_vesc_diag_requested.store(false);
+    g_vesc_diag_running = false;
+}
+
+// Helper: Check and attempt LiDAR reconnection
+void CheckLidarReconnect() {
+    // If LiDAR is already connected and streaming, nothing to do
+    if (g_lidar && g_lidar->isStreaming()) {
+        g_lidar_was_connected = true;
+        return;
+    }
+
+    // If we were previously connected and now we're not, log it
+    if (g_lidar_was_connected && (!g_lidar || !g_lidar->isStreaming())) {
+        g_shared.setStatusMessage("LiDAR connection lost - will retry...");
+        LOG_WARN("LiDAR", "Connection lost - will attempt reconnection");
+        g_lidar_was_connected = false;
+    }
+
+    // Try to reconnect periodically (every 5 seconds)
+    auto now = std::chrono::steady_clock::now();
+    float elapsed = std::chrono::duration<float>(now - g_last_lidar_reconnect_attempt).count();
+
+    if (elapsed >= 5.0f) {
+        g_last_lidar_reconnect_attempt = now;
+
+        // If we don't have a LiDAR instance, create one
+        if (!g_lidar) {
+            g_lidar = std::make_unique<slam::LivoxMid360>();
+            g_lidar->setPointCloudCallback(OnPointCloud);
+            g_lidar->setIMUCallback(OnIMU);
+        }
+
+        // Try to connect
+        if (g_lidar->connect(g_config.lidar_ip, g_config.host_ip)) {
+            g_shared.setStatusMessage("LiDAR reconnected!");
+            LOG_INFO("LiDAR", "Reconnected to " + std::string(g_config.lidar_ip));
+            g_lidar_was_connected = true;
+
+            // Update LiDAR status
+            LidarStatus lidar_status;
+            lidar_status.connection = ConnectionStatus::CONNECTED;
+            lidar_status.ip_address = g_config.lidar_ip;
+            g_shared.setLidarStatus(lidar_status);
+
+            // Create SLAM engine if needed
+            if (!g_slam) {
+                g_slam = std::make_unique<slam::SlamEngine>();
+                slam::SlamConfig slam_config;
+                slam_config.filter_size_surf = g_config.voxel_size;
+                slam_config.filter_size_map = g_config.voxel_size;
+                slam_config.gyr_cov = g_config.gyr_cov;
+                slam_config.acc_cov = g_config.gyr_cov;
+                slam_config.b_gyr_cov = 0.0001;
+                slam_config.b_acc_cov = 0.0001;
+                g_slam->init(slam_config);
+            }
+
+            g_shared.hardware_connected.store(true);
+        }
+    }
 }
 
 // Forward declaration for cleanup
@@ -783,10 +1167,13 @@ bool InitializeHardware() {
     g_lidar->setIMUCallback(OnIMU);
 
     if (!g_lidar->connect(g_config.lidar_ip, g_config.host_ip)) {
-        g_shared.setErrorMessage("Failed to connect to LiDAR at " + std::string(g_config.lidar_ip));
+        std::string err_msg = "Failed to connect to LiDAR at " + std::string(g_config.lidar_ip);
+        g_shared.setErrorMessage(err_msg);
+        LOG_ERROR("LiDAR", err_msg);
         ShutdownHardware();  // Cleanup partial init
         return false;
     }
+    LOG_INFO("LiDAR", "Connected to " + std::string(g_config.lidar_ip));
 
     // Update LiDAR status
     LidarStatus lidar_status;
@@ -796,13 +1183,19 @@ bool InitializeHardware() {
 
     g_shared.setStatusMessage("Initializing VESC...");
 
-    // Create VESC driver
-    g_vesc = std::make_unique<slam::VescDriver>();
-    if (!g_vesc->init(g_config.can_port, g_config.vesc_left_id, g_config.vesc_right_id)) {
-        g_shared.setErrorMessage("Failed to initialize VESC on " + std::string(g_config.can_port));
-        ShutdownHardware();  // Cleanup partial init
-        return false;
+    // Create VESC driver (with mutex to prevent race with diagnostics)
+    {
+        std::lock_guard<std::mutex> lock(g_vesc_mutex);
+        g_vesc = std::make_unique<slam::VescDriver>();
+        if (!g_vesc->init(g_config.can_port, g_config.vesc_left_id, g_config.vesc_right_id)) {
+            std::string err_msg = "Failed to initialize VESC on " + std::string(g_config.can_port);
+            g_shared.setErrorMessage(err_msg);
+            LOG_ERROR("VESC", err_msg);
+            ShutdownHardware();  // Cleanup partial init
+            return false;
+        }
     }
+    LOG_INFO("VESC", "Initialized on " + std::string(g_config.can_port));
 
     g_shared.setStatusMessage("Initializing SLAM engine...");
 
@@ -819,13 +1212,17 @@ bool InitializeHardware() {
     slam_config.b_acc_cov = 0.0001;
     // Processing parameters
     slam_config.max_iterations = g_config.max_iterations;
+    slam_config.max_points_icp = g_config.max_points_icp;  // CRITICAL for real-time performance
+    slam_config.max_map_points = g_config.max_map_points;  // Limit map growth to prevent slowdown
     slam_config.deskew_enabled = g_config.deskew_enabled;
     slam_config.save_map = true;
     if (!g_slam->init(slam_config)) {
         g_shared.setErrorMessage("Failed to initialize SLAM engine");
+        LOG_ERROR("SLAM", "Failed to initialize SLAM engine");
         ShutdownHardware();  // Cleanup partial init
         return false;
     }
+    LOG_INFO("SLAM", "Engine initialized");
 
     g_shared.setStatusMessage("Initializing sensor fusion...");
 
@@ -873,13 +1270,18 @@ void ShutdownHardware() {
     if (g_lidar) {
         g_lidar->stop();
     }
-    if (g_vesc) {
-        g_vesc->stop();
-        g_vesc->shutdown();
+
+    // Shutdown VESC with mutex to prevent race conditions
+    {
+        std::lock_guard<std::mutex> lock(g_vesc_mutex);
+        if (g_vesc) {
+            g_vesc->stop();
+            g_vesc->shutdown();
+        }
+        g_vesc.reset();
     }
 
     g_lidar.reset();
-    g_vesc.reset();
     g_slam.reset();
     g_fusion.reset();
     g_motion.reset();
@@ -926,13 +1328,29 @@ void ControlThread() {
             // Send motor commands
             g_motion->setVelocity(linear, angular);
             g_motion->update(dt);
-
-            // Update motor status for GUI
-            UpdateMotorStatus();
         } else if (g_motion) {
             // Not in drivable state - ensure motors are stopped
             g_motion->setVelocity(0.0f, 0.0f);
             g_motion->update(dt);
+        }
+
+        // Only check for reconnection AFTER initial hardware init is complete
+        // This prevents race conditions with WorkerThread's InitializeHardware()
+        if (g_hardware_initialized.load()) {
+            // Check for VESC disconnection and attempt reconnection
+            CheckVescReconnect();
+
+            // Check for LiDAR disconnection and attempt reconnection
+            CheckLidarReconnect();
+
+            // Update VESC cache for WorkerThread to read (single-thread arch)
+            UpdateVescCache();
+
+            // Update motor status for GUI (always, not just when driving)
+            UpdateMotorStatus();
+
+            // Process any pending VESC diagnostics request from main thread
+            ProcessVescDiagnostics();
         }
 
         // Precise 50Hz timing (20ms period)
@@ -1018,17 +1436,24 @@ void WorkerThread() {
 
         // 2. Process commands from GUI
         while (auto cmd = g_commands.pop()) {
+            // Log command received for diagnostics
+            if (g_diag_logger.isRunning()) {
+                g_diag_logger.logCommand(static_cast<int>(cmd->type), 0, "");
+            }
+
             switch (cmd->type) {
                 case CommandType::E_STOP:
                     g_e_stop.store(true);
                     g_shared.e_stop.store(true);
                     if (g_motion) g_motion->emergencyStop();
+                    LOG_WARN("System", "E-STOP activated - motors stopped");
                     break;
 
                 case CommandType::RESET_E_STOP:
                     g_e_stop.store(false);
                     g_shared.e_stop.store(false);
                     g_shared.setAppState(AppState::IDLE);
+                    LOG_INFO("System", "E-STOP reset - operation resumed");
                     break;
 
                 case CommandType::CONNECT_HARDWARE:
@@ -1045,6 +1470,17 @@ void WorkerThread() {
                     break;
 
                 case CommandType::START_MAPPING:
+                    // CRITICAL: Clear all stale sensor data first!
+                    {
+                        std::lock_guard<std::mutex> lock(g_completed_scans_mutex);
+                        g_completed_scans.clear();
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(g_imu_mutex);
+                        g_imu_queue.clear();
+                    }
+                    g_accumulated_points.clear();
+
                     if (g_slam) {
                         g_slam->reset();
                         g_slam->setLocalizationMode(false);
@@ -1103,38 +1539,91 @@ void WorkerThread() {
 
                 case CommandType::LOAD_MAP: {
                     auto* file_cmd = std::get_if<FileCommand>(&cmd->payload);
-                    if (file_cmd && g_slam) {
-                        g_shared.setStatusMessage("Loading pre-built map...");
-                        // Use loadPrebuiltMap() - stores in memory, doesn't replace ikd-tree
-                        // This allows FAST-LIO to build a local map for progressive localization
-                        if (g_slam->loadPrebuiltMap(file_cmd->path)) {
-                            g_shared.setAppState(AppState::MAP_LOADED);
-                            g_shared.setStatusMessage("Map loaded: " + file_cmd->path + " - Click Relocalize to start");
+                    if (file_cmd) {
+                        if (!g_slam) {
+                            // SLAM engine not initialized - try to load for preview only
+                            g_shared.setStatusMessage("Loading map for preview (LiDAR not connected)...");
 
-                            // Update localization viewer with pre-built map
+                            // Load PLY directly into viewer for preview
                             if (g_viewers_initialized && g_localization_viewer) {
-                                auto prebuilt = g_slam->getPrebuiltMapPoints();
                                 std::vector<slam::viz::PointData> gpu_points;
-                                gpu_points.reserve(prebuilt.size());
-                                for (const auto& wp : prebuilt) {
-                                    slam::viz::PointData pd;
-                                    pd.x = wp.x;
-                                    pd.y = wp.y;
-                                    pd.z = wp.z;
-                                    pd.intensity = static_cast<uint8_t>(std::clamp(wp.intensity, 0.0f, 255.0f));
-                                    pd.padding[0] = pd.padding[1] = pd.padding[2] = 0;
-                                    gpu_points.push_back(pd);
-                                }
-                                g_localization_viewer->updatePointCloud(gpu_points.data(), gpu_points.size());
-                                g_localization_viewer->fitCameraToContent();
-                            }
+                                std::ifstream ply_file(file_cmd->path);
+                                if (ply_file.is_open()) {
+                                    std::string line;
+                                    bool header_done = false;
+                                    size_t vertex_count = 0;
 
-                            // Reset relocalization progress
-                            RelocalizationProgress prog;
-                            prog.status_text = "Map loaded - ready to start localization";
-                            g_shared.setRelocalizationProgress(prog);
+                                    // Parse PLY header
+                                    while (std::getline(ply_file, line)) {
+                                        if (line.find("element vertex") != std::string::npos) {
+                                            sscanf(line.c_str(), "element vertex %zu", &vertex_count);
+                                        }
+                                        if (line == "end_header") {
+                                            header_done = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if (header_done && vertex_count > 0) {
+                                        gpu_points.reserve(vertex_count);
+                                        float x, y, z;
+                                        int intensity;
+                                        while (ply_file >> x >> y >> z >> intensity) {
+                                            slam::viz::PointData pd;
+                                            pd.x = x;
+                                            pd.y = y;
+                                            pd.z = z;
+                                            pd.intensity = static_cast<uint8_t>(std::clamp(intensity, 0, 255));
+                                            pd.padding[0] = pd.padding[1] = pd.padding[2] = 0;
+                                            gpu_points.push_back(pd);
+                                        }
+
+                                        g_localization_viewer->updatePointCloud(gpu_points.data(), gpu_points.size());
+                                        g_localization_viewer->fitCameraToContent();
+                                        g_shared.setStatusMessage("Map preview loaded (" + std::to_string(gpu_points.size()) + " points) - Connect LiDAR to localize");
+                                        g_shared.setAppState(AppState::IDLE);  // Can't localize without LiDAR
+                                    } else {
+                                        g_shared.setErrorMessage("Failed to parse PLY file");
+                                    }
+                                } else {
+                                    g_shared.setErrorMessage("Cannot open map file: " + file_cmd->path);
+                                }
+                            } else {
+                                g_shared.setErrorMessage("Cannot load map: LiDAR not connected");
+                            }
                         } else {
-                            g_shared.setErrorMessage("Failed to load map");
+                            g_shared.setStatusMessage("Loading pre-built map...");
+                            // Use loadPrebuiltMap() - stores in memory, doesn't replace ikd-tree
+                            // This allows FAST-LIO to build a local map for progressive localization
+                            if (g_slam->loadPrebuiltMap(file_cmd->path)) {
+                                g_shared.setAppState(AppState::MAP_LOADED);
+                                g_shared.setStatusMessage("Map loaded: " + file_cmd->path + " - Click Relocalize to start");
+
+                                // Update localization viewer with pre-built map
+                                if (g_viewers_initialized && g_localization_viewer) {
+                                    auto prebuilt = g_slam->getPrebuiltMapPoints();
+                                    std::vector<slam::viz::PointData> gpu_points;
+                                    gpu_points.reserve(prebuilt.size());
+                                    for (const auto& wp : prebuilt) {
+                                        slam::viz::PointData pd;
+                                        pd.x = wp.x;
+                                        pd.y = wp.y;
+                                        pd.z = wp.z;
+                                        pd.intensity = static_cast<uint8_t>(std::clamp(wp.intensity, 0.0f, 255.0f));
+                                        pd.padding[0] = pd.padding[1] = pd.padding[2] = 0;
+                                        gpu_points.push_back(pd);
+                                    }
+                                    g_localization_viewer->updatePointCloud(gpu_points.data(), gpu_points.size());
+                                    g_localization_viewer->fitCameraToContent();
+                                }
+
+                                // Reset relocalization progress
+                                RelocalizationProgress prog;
+                                prog.status_text = "Map loaded - ready to start localization";
+                                g_shared.setRelocalizationProgress(prog);
+                            } else {
+                                g_shared.setErrorMessage("Failed to load map file");
+                            }
                         }
                     }
                     break;
@@ -1187,6 +1676,78 @@ void WorkerThread() {
                     }
                     break;
 
+                case CommandType::RUN_GLOBAL_LOCALIZATION:
+                    if (g_shared.getAppState() == AppState::RELOCALIZING && g_slam) {
+                        if (!g_slam->isReadyForGlobalLocalization()) {
+                            g_shared.setStatusMessage("Not ready yet - continue building map");
+                            break;
+                        }
+
+                        // Stop robot before ICP
+                        g_target_linear.store(0.0f);
+                        g_target_angular.store(0.0f);
+                        g_shared.setStatusMessage("Running global localization - please wait...");
+
+                        // Update progress to show ICP is running
+                        RelocalizationProgress prog = g_shared.getRelocalizationProgress();
+                        prog.icp_running = true;
+                        prog.ready_to_localize = false;
+                        prog.status_text = "Starting ICP alignment...";
+                        g_shared.setRelocalizationProgress(prog);
+
+                        // Progress callback for ICP stages
+                        auto progress_callback = [](const slam::LocalizationProgress& p) {
+                            RelocalizationProgress prog = g_shared.getRelocalizationProgress();
+                            prog.icp_stage = slam::toString(p.stage);
+                            prog.icp_progress = p.progress;
+                            prog.icp_fitness = static_cast<float>(p.current_fitness);
+                            prog.icp_hypotheses = p.hypotheses_count;
+                            prog.icp_kept = p.hypotheses_kept;
+                            prog.icp_iteration = p.current_iteration;
+                            prog.icp_max_iterations = p.max_iterations;
+                            prog.status_text = p.message;
+                            prog.progress = p.progress;
+                            g_shared.setRelocalizationProgress(prog);
+                        };
+
+                        // Run global localization (this blocks but reports progress via callback)
+                        slam::LocalizationResult result = g_slam->runGlobalLocalization(progress_callback);
+
+                        // Update final state
+                        prog = g_shared.getRelocalizationProgress();
+                        prog.icp_running = false;
+
+                        if (result.status == slam::LocalizationStatus::SUCCESS) {
+                            prog.running = false;
+                            prog.success = true;
+                            prog.confidence = static_cast<float>(result.confidence);
+                            prog.status_text = "Localized! (" + std::to_string(int(result.confidence * 100)) + "% confidence)";
+                            g_shared.setAppState(AppState::LOCALIZED);
+                            g_shared.setStatusMessage("Localization successful!");
+                        } else if (result.status == slam::LocalizationStatus::FAILED) {
+                            prog.running = false;
+                            prog.success = false;
+                            prog.status_text = result.message;
+                            g_shared.setAppState(AppState::RELOCALIZE_FAILED);
+                            g_shared.setStatusMessage("Localization failed");
+                        } else {
+                            // LOW_CONFIDENCE or cancelled - allow retry
+                            prog.ready_to_localize = true;
+                            prog.status_text = result.message;
+                            g_shared.setStatusMessage(result.message);
+                        }
+
+                        g_shared.setRelocalizationProgress(prog);
+                    }
+                    break;
+
+                case CommandType::CANCEL_GLOBAL_LOCALIZATION:
+                    if (g_slam) {
+                        g_slam->cancelGlobalLocalization();
+                        g_shared.setStatusMessage("Cancelling localization...");
+                    }
+                    break;
+
                 case CommandType::SET_VELOCITY: {
                     // Legacy command - velocity now set directly via atomics from main thread
                     // Keep handler for any remaining command-based callers
@@ -1233,12 +1794,13 @@ void WorkerThread() {
                         g_shared.setStatusMessage(status);
                     };
 
-                    // Check for cancellation (peek at queue without blocking)
-                    static std::atomic<bool> cancel_requested{false};
-                    cancel_requested.store(false);
+                    // Reset calibration cancel flag at start
+                    g_calibration_cancel.store(false);
+
                     auto should_cancel = [&]() -> bool {
-                        // Quick check - actual cancellation handled in main command loop
-                        return cancel_requested.load();
+                        // Check e-stop and calibration cancel flags directly
+                        // These bypass the command queue for immediate response
+                        return g_e_stop.load() || g_calibration_cancel.load();
                     };
 
                     bool success = true;
@@ -1360,10 +1922,24 @@ void WorkerThread() {
                     break;
 
                 case CommandType::CLEAR_MAP:
+                    // Clear all stale sensor data
+                    {
+                        std::lock_guard<std::mutex> lock(g_completed_scans_mutex);
+                        g_completed_scans.clear();
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(g_imu_mutex);
+                        g_imu_queue.clear();
+                    }
+                    g_accumulated_points.clear();
+
                     if (g_slam) {
                         g_slam->reset();
                     }
                     g_shared.clearTrajectory();
+                    // Also clear the visible map points in SharedState
+                    g_shared.setMapPoints({});
+                    g_shared.setCurrentScan({});
                     g_shared.setStatusMessage("Map cleared");
                     break;
 
@@ -1476,10 +2052,55 @@ void WorkerThread() {
                 g_completed_scans.clear();
             }
 
-            // Run SLAM processing
+            // Run SLAM processing with timing
+            auto slam_start = std::chrono::steady_clock::now();
             int processed = g_slam->process();
+            auto slam_end = std::chrono::steady_clock::now();
+
             if (processed > 0) {
                 g_slam_process_count++;  // Debug counter
+                float slam_time_ms = std::chrono::duration<float, std::milli>(slam_end - slam_start).count();
+                g_perf.recordSlamUpdate(slam_time_ms);
+                g_perf.map_points.store(static_cast<int>(g_slam->getMapSize()));
+
+                // Log SLAM timing for diagnostics
+                if (g_diag_logger.isRunning()) {
+                    g_diag_logger.logSlamTiming(
+                        slam_time_ms,
+                        0.0f, 0.0f, 0.0f, slam_time_ms, 0.0f,  // Detailed breakdown (approximated)
+                        0, 0, 0, 0);  // Point counts (would need SLAM engine changes)
+
+                    // Log map statistics
+                    size_t map_size = g_slam->getMapSize();
+                    float extent[6] = {0, 0, 0, 0, 0, 0};  // Would need SLAM engine query
+                    g_diag_logger.logSlamMapStats(
+                        static_cast<uint32_t>(map_size), 0, 0, extent, 0, 0);
+                }
+            }
+
+            // Update buffer sizes for performance monitoring
+            int imu_buf_size = 0, scan_buf_size = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_imu_mutex);
+                imu_buf_size = static_cast<int>(g_imu_queue.size());
+                g_perf.buffer_imu.store(imu_buf_size);
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_completed_scans_mutex);
+                scan_buf_size = static_cast<int>(g_completed_scans.size());
+                g_perf.buffer_scans.store(scan_buf_size);
+            }
+
+            // Log buffer status periodically (10 Hz)
+            static auto last_buffer_log = std::chrono::steady_clock::now();
+            auto now_buf = std::chrono::steady_clock::now();
+            if (g_diag_logger.isRunning() &&
+                std::chrono::duration<float>(now_buf - last_buffer_log).count() >= 0.1f) {
+                last_buffer_log = now_buf;
+                g_diag_logger.logBufferStatus(
+                    static_cast<uint32_t>(imu_buf_size),
+                    static_cast<uint32_t>(scan_buf_size),
+                    static_cast<uint32_t>(g_commands.size()));
             }
 
             // Update SLAM state to GUI
@@ -1511,6 +2132,8 @@ void WorkerThread() {
                 switch (loc_result.status) {
                     case slam::LocalizationStatus::ACCUMULATING:
                         prog.accumulating = true;
+                        prog.ready_to_localize = false;
+                        prog.icp_running = false;
                         prog.status_text = "Building map: " +
                             std::to_string(loc_result.local_map_voxels) + " voxels, " +
                             std::to_string(int(loc_result.rotation_deg)) + " deg rotation";
@@ -1518,19 +2141,39 @@ void WorkerThread() {
 
                     case slam::LocalizationStatus::VIEW_SATURATED:
                         prog.accumulating = true;
+                        prog.ready_to_localize = false;
+                        prog.icp_running = false;
                         prog.status_text = "View saturated - rotate robot for more coverage";
                         break;
 
-                    case slam::LocalizationStatus::READY_TO_ATTEMPT:
+                    case slam::LocalizationStatus::READY_FOR_LOCALIZATION:
+                        // Coverage is sufficient - robot should stop and user clicks "Localize Now"
+                        prog.accumulating = false;
+                        prog.ready_to_localize = true;
+                        prog.icp_running = false;
+                        prog.status_text = "Ready! Stop robot and click 'Localize Now'";
+                        break;
+
+                    case slam::LocalizationStatus::AWAITING_ROBOT_STOP:
+                        prog.accumulating = false;
+                        prog.ready_to_localize = true;
+                        prog.icp_running = false;
+                        prog.status_text = "Waiting for robot to stop...";
+                        break;
+
                     case slam::LocalizationStatus::ATTEMPTING:
                         prog.accumulating = false;
-                        prog.status_text = "Attempting localization (attempt " +
-                            std::to_string(loc_result.attempt_number) + ")...";
+                        prog.ready_to_localize = false;
+                        prog.icp_running = true;
+                        prog.status_text = "Running ICP alignment...";
                         break;
 
                     case slam::LocalizationStatus::LOW_CONFIDENCE:
-                        prog.accumulating = true;
-                        prog.status_text = "Low confidence - continue rotating robot...";
+                        prog.accumulating = false;
+                        prog.ready_to_localize = true;  // Can try again
+                        prog.icp_running = false;
+                        prog.status_text = "Low confidence (" + std::to_string(int(loc_result.confidence * 100)) +
+                            "%) - try again or move robot";
                         break;
 
                     case slam::LocalizationStatus::SUCCESS:
@@ -1570,13 +2213,18 @@ void WorkerThread() {
         }
 
         // 4. Update wheel odometry and sensor fusion
-        if (g_vesc && g_fusion) {
-            // Get odometry from VESC
-            slam::VescOdometry odom = g_vesc->getOdometry();
+        // Read from cache (updated by ControlThread) - avoids cross-thread VESC access
+        if (g_fusion) {
+            slam::VescOdometry odom;
+            slam::VescStatus status_l, status_r;
 
-            // Get ERPM for motion state detection
-            slam::VescStatus status_l = g_vesc->getStatus(g_config.vesc_left_id);
-            slam::VescStatus status_r = g_vesc->getStatus(g_config.vesc_right_id);
+            // Read from cache (single-thread VESC architecture)
+            {
+                std::lock_guard<std::mutex> lock(g_vesc_cache_mutex);
+                odom = g_vesc_odom_cache;
+                status_l = g_vesc_status_left_cache;
+                status_r = g_vesc_status_right_cache;
+            }
 
             // Calculate linear velocity from wheel velocities
             float linear_vel = (odom.velocity_left_mps + odom.velocity_right_mps) / 2.0f;
@@ -1640,6 +2288,25 @@ void WorkerThread() {
             gui_wheel.y = wheel_pose.y;
             gui_wheel.yaw = wheel_pose.theta;
             g_shared.setWheelOdomPose(gui_wheel);
+
+            // Log fused pose and wheel odometry for diagnostics
+            if (g_diag_logger.isRunning()) {
+                // Log fused pose
+                int motion_int = (motion == slam::MotionState::STATIONARY) ? 0 :
+                                 (motion == slam::MotionState::STRAIGHT_LINE) ? 1 : 2;
+                g_diag_logger.logFusedPose(
+                    fused.x, fused.y, fused.z,
+                    fused.roll, fused.pitch, fused.yaw,
+                    fused_vel.linear_x, fused_vel.angular_z,
+                    motion_int, 0.5f, 0.5f);  // Weights not exposed yet
+
+                // Log wheel odometry (simplified - get from VESC cache)
+                g_diag_logger.logWheelOdom(
+                    wheel_pose.x, wheel_pose.y, wheel_pose.theta,
+                    static_cast<float>(gui_vel.linear), static_cast<float>(gui_vel.angular),
+                    0, 0,  // Tach values from VESC status logged separately
+                    0.0f, 0.0f);  // Distance not tracked here
+            }
 
             // Add trajectory point
             if (state == AppState::MAPPING || state == AppState::LOCALIZED || state == AppState::OPERATING) {
@@ -1990,23 +2657,62 @@ void DrawStatusBar() {
 
     ImGui::Begin("##StatusBar", nullptr, flags);
 
-    // LiDAR status
+    // LiDAR status (clickable for diagnostics)
     LidarStatus lidar = g_shared.getLidarStatus();
-    ImVec4 lidar_color = (lidar.connection == ConnectionStatus::CONNECTED)
-        ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-    ImGui::TextColored(lidar_color, "LiDAR");
-    SetTooltip("LiDAR connection status. Green = connected.");
+    // More detailed status: green only if actually streaming data
+    bool lidar_streaming = g_lidar && g_lidar->isStreaming();
+    bool lidar_connected = (lidar.connection == ConnectionStatus::CONNECTED);
+    ImVec4 lidar_color;
+    const char* lidar_tooltip;
+    if (lidar_streaming) {
+        lidar_color = ImVec4(0.2f, 1.0f, 0.2f, 1.0f);  // Green - fully working
+        lidar_tooltip = "LiDAR streaming data - click for diagnostics";
+    } else if (lidar_connected) {
+        lidar_color = ImVec4(1.0f, 1.0f, 0.2f, 1.0f);  // Yellow - connected but not streaming
+        lidar_tooltip = "LiDAR connected but NOT streaming - click for diagnostics";
+    } else {
+        lidar_color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);  // Gray - disconnected
+        lidar_tooltip = "LiDAR disconnected - click for diagnostics";
+    }
+
+    // Make LiDAR text clickable
+    ImGui::PushStyleColor(ImGuiCol_Text, lidar_color);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.3f, 0.3f, 0.5f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.4f, 0.4f, 0.4f, 0.5f));
+    if (ImGui::SmallButton("LiDAR")) {
+        g_show_lidar_diagnostics = true;
+    }
+    ImGui::PopStyleColor(4);
+    SetTooltip(lidar_tooltip);
     ImGui::SameLine();
     ImGui::Text("|");
     ImGui::SameLine();
 
-    // VESC status
+    // VESC status (clickable for diagnostics when disconnected)
     MotorStatus motor_l = g_shared.getMotorStatus(0);
     MotorStatus motor_r = g_shared.getMotorStatus(1);
     bool vesc_ok = motor_l.connected || motor_r.connected;
     ImVec4 vesc_color = vesc_ok ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-    ImGui::TextColored(vesc_color, "VESC");
-    SetTooltip("Motor controller connection. Green = connected.");
+
+    // Make VESC text clickable
+    ImGui::PushStyleColor(ImGuiCol_Text, vesc_color);
+    if (!vesc_ok) {
+        // Show as clickable when disconnected
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.3f, 0.3f, 0.5f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.4f, 0.4f, 0.4f, 0.5f));
+        if (ImGui::SmallButton("VESC")) {
+            // Run VESC diagnostics
+            g_show_vesc_diagnostics = true;
+        }
+        ImGui::PopStyleColor(3);
+        SetTooltip("VESC disconnected - click to run diagnostics");
+    } else {
+        ImGui::Text("VESC");
+        SetTooltip("Motor controller connected.");
+    }
+    ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::Text("|");
     ImGui::SameLine();
@@ -2026,10 +2732,29 @@ void DrawStatusBar() {
     ImGui::Text("|");
     ImGui::SameLine();
 
-    // Gamepad status
+    // Gamepad status with battery
     ImVec4 gp_color = g_gamepad_connected ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+#ifdef HAS_SDL2
+    int gp_battery = g_gamepad ? g_gamepad->getBatteryLevel() : -1;
+    if (g_gamepad_connected && gp_battery >= 0) {
+        // Show gamepad with battery level
+        ImVec4 gp_batt_color = (gp_battery > 50) ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) :
+                               (gp_battery > 20) ? ImVec4(1.0f, 1.0f, 0.2f, 1.0f) :
+                                                   ImVec4(1.0f, 0.3f, 0.2f, 1.0f);
+        ImGui::TextColored(gp_color, "Gamepad");
+        ImGui::SameLine(0, 2);
+        ImGui::TextColored(gp_batt_color, "(%d%%)", gp_battery);
+        char gp_tooltip[64];
+        snprintf(gp_tooltip, sizeof(gp_tooltip), "Gamepad connected. Battery: %d%%", gp_battery);
+        SetTooltip(gp_tooltip);
+    } else {
+        ImGui::TextColored(gp_color, "Gamepad");
+        SetTooltip("Xbox/PS5 controller. Use for manual robot control.");
+    }
+#else
     ImGui::TextColored(gp_color, "Gamepad");
-    SetTooltip("Xbox controller connection. Use for manual robot control.");
+    SetTooltip("Xbox/PS5 controller. Use for manual robot control.");
+#endif
     ImGui::SameLine();
     ImGui::Text("|");
     ImGui::SameLine();
@@ -2040,6 +2765,81 @@ void DrawStatusBar() {
     getStateColor(state, r, g, b, a);
     ImGui::TextColored(ImVec4(r, g, b, a), "%s", getStateName(state));
     SetTooltip("Current application mode.");
+    ImGui::SameLine();
+    ImGui::Text("|");
+    ImGui::SameLine();
+
+    // System Log button - show count of errors/warnings
+    int error_count = 0, warn_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        for (const auto& entry : g_system_log) {
+            if (entry.level == LogLevel::ERROR_LEVEL) error_count++;
+            else if (entry.level == LogLevel::WARNING) warn_count++;
+        }
+    }
+    if (error_count > 0) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.1f, 0.1f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
+    } else if (warn_count > 0) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.5f, 0.1f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.6f, 0.2f, 1.0f));
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+    }
+    if (ImGui::SmallButton("Log")) {
+        g_show_system_log = true;
+    }
+    ImGui::PopStyleColor(2);
+    char log_tooltip[64];
+    snprintf(log_tooltip, sizeof(log_tooltip), "System Log: %d errors, %d warnings. Click to view.", error_count, warn_count);
+    SetTooltip(log_tooltip);
+
+    ImGui::SameLine();
+    ImGui::Text("|");
+    ImGui::SameLine();
+
+    // Diagnostic Recording button (REC)
+    bool is_logging = g_diag_logger.isRunning();
+    if (is_logging) {
+        // Blinking red when recording
+        float blink = (std::sin(g_current_time * 6.0f) + 1.0f) * 0.5f;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.1f * blink, 0.1f * blink, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
+        if (ImGui::SmallButton("REC")) {
+            g_diag_logger.stop();
+            g_logging_enabled = false;
+            AddLogEntry(LogLevel::INFO, "Logger", "Diagnostic recording stopped");
+        }
+        ImGui::PopStyleColor(2);
+        char rec_tooltip[128];
+        snprintf(rec_tooltip, sizeof(rec_tooltip), "RECORDING: %.1fs, %.1f MB, %zu msgs. Click to stop.",
+                 g_diag_logger.getElapsedSeconds(),
+                 static_cast<float>(g_diag_logger.getFileSizeMB()),
+                 g_diag_logger.getMessageCount());
+        SetTooltip(rec_tooltip);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.4f, 0.2f, 0.2f, 1.0f));
+        if (ImGui::SmallButton("REC")) {
+            // Create logs directory if needed
+            std::filesystem::create_directories("logs");
+
+            LoggingConfig config;
+            config.output_dir = "logs";
+            config.point_downsample = 10;  // Log every 10th point
+            config.imu_downsample = 5;     // Log every 5th IMU sample
+            if (g_diag_logger.start(g_log_session_name, config)) {
+                g_logging_enabled = true;
+                AddLogEntry(LogLevel::INFO, "Logger", "Diagnostic recording started: " + g_diag_logger.getFilePath());
+            } else {
+                AddLogEntry(LogLevel::ERROR_LEVEL, "Logger", "Failed to start diagnostic recording");
+            }
+        }
+        ImGui::PopStyleColor(2);
+        SetTooltip("Start diagnostic recording. Logs all sensor data, SLAM state, and performance metrics.");
+    }
 
     // E-STOP button on the right
     ImGui::SameLine(ImGui::GetWindowWidth() - 120);
@@ -2221,29 +3021,38 @@ void DrawOperateTab() {
     }
 
     // Get and draw map points (cached locally for performance)
+    // WARNING: Drawing many points via ImGui is CPU-intensive! Use g_config.operate_show_map to disable
     static std::vector<RenderPoint> cached_map_points;
     static std::vector<RenderPoint> cached_scan_points;
     g_shared.getMapPointsIfUpdated(cached_map_points);
     g_shared.getCurrentScanIfUpdated(cached_scan_points);
 
-    // Draw map points (small dots, colored by height)
-    // Use 3D projection for tilted views (actual Z coordinate)
-    for (const auto& pt : cached_map_points) {
-        ImVec2 screen_pos = worldToScreen3D(pt.x, pt.y, pt.z);
-        // Skip points outside view
-        if (screen_pos.x < canvas_pos.x - 5 || screen_pos.x > canvas_pos.x + canvas_size.x + 5 ||
-            screen_pos.y < canvas_pos.y - 5 || screen_pos.y > canvas_pos.y + canvas_size.y + 5) continue;
-        // Vary point size slightly based on Z for depth cue
-        float z_factor = 1.0f + (pt.z * 0.05f);  // Higher points slightly larger
-        draw_list->AddCircleFilled(screen_pos, 1.5f * z_factor, IM_COL32(pt.r, pt.g, pt.b, 180));
+    // Draw map points only if enabled (disabled by default for performance)
+    if (g_config.operate_show_map && !cached_map_points.empty()) {
+        // Limit points for performance
+        int step = std::max(1, (int)cached_map_points.size() / g_config.operate_max_points);
+        int rendered = 0;
+        for (size_t i = 0; i < cached_map_points.size() && rendered < g_config.operate_max_points; i += step) {
+            const auto& pt = cached_map_points[i];
+            ImVec2 screen_pos = worldToScreen3D(pt.x, pt.y, pt.z);
+            // Skip points outside view
+            if (screen_pos.x < canvas_pos.x - 5 || screen_pos.x > canvas_pos.x + canvas_size.x + 5 ||
+                screen_pos.y < canvas_pos.y - 5 || screen_pos.y > canvas_pos.y + canvas_size.y + 5) continue;
+            // Vary point size slightly based on Z for depth cue
+            float z_factor = 1.0f + (pt.z * 0.05f);  // Higher points slightly larger
+            draw_list->AddCircleFilled(screen_pos, 1.5f * z_factor, IM_COL32(pt.r, pt.g, pt.b, 180));
+            rendered++;
+        }
     }
 
-    // Draw current scan points (brighter, larger)
-    for (const auto& pt : cached_scan_points) {
-        ImVec2 screen_pos = worldToScreen3D(pt.x, pt.y, pt.z);
-        if (screen_pos.x < canvas_pos.x - 5 || screen_pos.x > canvas_pos.x + canvas_size.x + 5 ||
-            screen_pos.y < canvas_pos.y - 5 || screen_pos.y > canvas_pos.y + canvas_size.y + 5) continue;
-        draw_list->AddCircleFilled(screen_pos, 2.5f, IM_COL32(200, 255, 255, 255));
+    // Draw current scan points (disabled by default for performance)
+    if (g_config.operate_show_scan && !cached_scan_points.empty()) {
+        for (const auto& pt : cached_scan_points) {
+            ImVec2 screen_pos = worldToScreen3D(pt.x, pt.y, pt.z);
+            if (screen_pos.x < canvas_pos.x - 5 || screen_pos.x > canvas_pos.x + canvas_size.x + 5 ||
+                screen_pos.y < canvas_pos.y - 5 || screen_pos.y > canvas_pos.y + canvas_size.y + 5) continue;
+            draw_list->AddCircleFilled(screen_pos, 2.5f, IM_COL32(200, 255, 255, 255));
+        }
     }
 
     // Draw trajectory
@@ -2417,11 +3226,19 @@ void DrawOperateTab() {
     bool is_operating = (state == AppState::OPERATING);
 
     if (!is_operating) {
-        bool can_operate = (state == AppState::IDLE);
+        // Allow starting operating from IDLE, MAPPING, or LOCALIZED (auto-switch)
+        bool can_operate = (state == AppState::IDLE || state == AppState::MAPPING ||
+                           state == AppState::LOCALIZED);
         ImGui::BeginDisabled(!can_operate);
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.8f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 0.9f, 1.0f));
         if (ImGui::Button("Start Operating", ImVec2(200, 40))) {
+            // Auto-stop current mode if needed
+            if (state == AppState::MAPPING) {
+                g_commands.push(Command::simple(CommandType::STOP_MAPPING));
+            } else if (state == AppState::LOCALIZED) {
+                g_commands.push(Command::simple(CommandType::STOP_LOCALIZATION));
+            }
             g_commands.push(Command::simple(CommandType::START_OPERATING));
         }
         SetTooltip("Enable manual drive without SLAM. Use for positioning or testing.");
@@ -2678,7 +3495,16 @@ void DrawMappingTab() {
 
     // Left side - Map viewer (GPU-accelerated when available)
     ImGui::BeginChild("MappingViewer", ImVec2(-panel_width - 10, 0), true);
-    ImGui::Text("Live Map View");
+
+    // Header with point count
+    size_t point_count = g_shared.getMapPointCount();
+    if (point_count > 1000000) {
+        ImGui::Text("Live Map View (%.2fM points)", point_count / 1000000.0f);
+    } else if (point_count > 1000) {
+        ImGui::Text("Live Map View (%.1fK points)", point_count / 1000.0f);
+    } else {
+        ImGui::Text("Live Map View (%zu points)", point_count);
+    }
     ImGui::Separator();
 
     if (g_viewers_initialized && g_mapping_viewer) {
@@ -2710,21 +3536,21 @@ void DrawMappingTab() {
 
     // Start/Stop mapping
     if (!is_mapping) {
-        if (state == AppState::IDLE) {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 0.3f, 1.0f));
-            if (ImGui::Button("Start Mapping", ImVec2(-1, 50))) {
-                g_commands.push(Command::simple(CommandType::START_MAPPING));
+        // Allow starting mapping from IDLE or OPERATING (auto-switch)
+        bool can_start = (state == AppState::IDLE || state == AppState::OPERATING);
+        ImGui::BeginDisabled(!can_start);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 0.3f, 1.0f));
+        if (ImGui::Button("Start Mapping", ImVec2(-1, 50))) {
+            // Auto-stop operating if currently in that mode
+            if (state == AppState::OPERATING) {
+                g_commands.push(Command::simple(CommandType::STOP_OPERATING));
             }
-            SetTooltip("Begin building a new map.");
-            ImGui::PopStyleColor(2);
-        } else {
-            ImGui::BeginDisabled();
-            ImGui::Button("Start Mapping", ImVec2(-1, 50));
-            ImGui::EndDisabled();
-            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
-                "Stop current op first");
+            g_commands.push(Command::simple(CommandType::START_MAPPING));
         }
+        SetTooltip("Begin building a new map.");
+        ImGui::PopStyleColor(2);
+        ImGui::EndDisabled();
     } else {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.3f, 0.3f, 1.0f));
@@ -2744,6 +3570,91 @@ void DrawMappingTab() {
     size_t map_points = g_shared.getMapPointCount();
     ImGui::Text("Points: %zu", map_points);
     ImGui::Text("Trajectory: %zu pts", g_shared.getTrajectory().size());
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Viewer disabled warning
+    if (g_config.disable_map_viewer) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "[VIEWER DISABLED]");
+        SetTooltip("Map viewer updates disabled for performance testing. Enable in Settings > 3D Viewer.");
+    }
+
+    // Performance metrics section
+    ImGui::Text("Performance Metrics");
+
+    // SLAM rate with color coding (green=good, yellow=slow, red=critical)
+    float slam_rate = g_perf.slam_rate_hz.load();
+    float slam_time = g_perf.slam_time_ms.load();
+    float avg_slam_time = g_perf.getAvgSlamTime();
+
+    ImVec4 rate_color;
+    if (slam_rate >= 9.0f) {
+        rate_color = ImVec4(0.2f, 0.8f, 0.2f, 1.0f);  // Green - good
+    } else if (slam_rate >= 5.0f) {
+        rate_color = ImVec4(0.9f, 0.7f, 0.1f, 1.0f);  // Yellow - slow
+    } else {
+        rate_color = ImVec4(0.9f, 0.2f, 0.2f, 1.0f);  // Red - critical
+    }
+    ImGui::TextColored(rate_color, "SLAM Rate: %.1f Hz", slam_rate);
+    SetTooltip("Target: 10 Hz (LiDAR scan rate). Below 5 Hz = falling behind.");
+
+    // SLAM processing time with color coding
+    ImVec4 time_color;
+    if (avg_slam_time < 50.0f) {
+        time_color = ImVec4(0.2f, 0.8f, 0.2f, 1.0f);  // Green - plenty of headroom
+    } else if (avg_slam_time < 80.0f) {
+        time_color = ImVec4(0.9f, 0.7f, 0.1f, 1.0f);  // Yellow - getting tight
+    } else {
+        time_color = ImVec4(0.9f, 0.2f, 0.2f, 1.0f);  // Red - over budget
+    }
+    ImGui::TextColored(time_color, "SLAM Time: %.1f ms (avg %.1f)", slam_time, avg_slam_time);
+    SetTooltip("Time per SLAM update. Budget: <100ms (10Hz). If >100ms, falling behind.");
+
+    // Buffer status - critical indicator for falling behind
+    int imu_buffer = g_perf.buffer_imu.load();
+    int scan_buffer = g_perf.buffer_scans.load();
+
+    ImVec4 buffer_color;
+    if (scan_buffer > 3 || imu_buffer > 100) {
+        buffer_color = ImVec4(0.9f, 0.2f, 0.2f, 1.0f);  // Red - backed up!
+    } else if (scan_buffer > 1 || imu_buffer > 50) {
+        buffer_color = ImVec4(0.9f, 0.7f, 0.1f, 1.0f);  // Yellow - getting behind
+    } else {
+        buffer_color = ImVec4(0.6f, 0.6f, 0.6f, 1.0f);  // Gray - normal
+    }
+    ImGui::TextColored(buffer_color, "Buffers: %d scans, %d IMU", scan_buffer, imu_buffer);
+    SetTooltip("Waiting data. Scans>2 or IMU>50 means CPU can't keep up.");
+
+    // Map point count from performance tracker with limit indicator
+    int map_pts = g_perf.map_points.load();
+    int map_limit = g_config.max_map_points;
+    ImVec4 map_color;
+    if (map_limit > 0 && map_pts >= map_limit) {
+        map_color = ImVec4(1.0f, 0.3f, 0.3f, 1.0f);  // Red - at limit
+    } else if (map_limit > 0 && map_pts >= map_limit * 0.8f) {
+        map_color = ImVec4(0.9f, 0.7f, 0.1f, 1.0f);  // Yellow - approaching limit
+    } else {
+        map_color = ImVec4(0.6f, 0.6f, 0.6f, 1.0f);  // Gray - normal
+    }
+    if (map_limit > 0) {
+        ImGui::TextColored(map_color, "Map: %dK / %dK pts", map_pts / 1000, map_limit / 1000);
+        SetTooltip("Map size vs limit. Red = at limit, oldest points will be culled.");
+    } else {
+        ImGui::Text("Map Size: %dK pts (no limit)", map_pts / 1000);
+    }
+
+    // LiDAR input rates
+    LidarStatus lidar = g_shared.getLidarStatus();
+    if (lidar.point_rate > 0) {
+        float pts_per_sec_k = lidar.point_rate / 1000.0f;
+        ImGui::Text("LiDAR: %.0fK pts/s, %d Hz IMU", pts_per_sec_k, lidar.imu_rate);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
 
     // Current pose
     Pose3D pose = g_shared.getFusedPose();
@@ -2795,7 +3706,16 @@ void DrawLocalizationTab() {
 
     // Left side - Map viewer (GPU-accelerated with dual-map display)
     ImGui::BeginChild("LocalizationViewer", ImVec2(-panel_width - 10, 0), true);
-    ImGui::Text("Map View (Pre-built + Local)");
+
+    // Header with point count
+    size_t local_points = g_shared.getMapPointCount();
+    if (local_points > 1000000) {
+        ImGui::Text("Map View (%.2fM local points)", local_points / 1000000.0f);
+    } else if (local_points > 1000) {
+        ImGui::Text("Map View (%.1fK local points)", local_points / 1000.0f);
+    } else {
+        ImGui::Text("Map View (%zu local points)", local_points);
+    }
     ImGui::Separator();
 
     if (g_viewers_initialized && g_localization_viewer) {
@@ -2865,24 +3785,79 @@ void DrawLocalizationTab() {
     // Initial pose hint (optional)
     static float hint_x = 0.0f, hint_y = 0.0f, hint_yaw = 0.0f;
     static bool use_pose_hint = false;
+    static bool click_to_pose_active = false;
+
     ImGui::Checkbox("Use pose hint", &use_pose_hint);
     ImGui::SameLine();
     HelpMarker("Provide approximate position to help.");
 
     if (use_pose_hint) {
+        // Visual pose hint button - click on map
+        if (g_viewers_initialized && g_localization_viewer) {
+            bool was_active = click_to_pose_active;
+            if (click_to_pose_active) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.3f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.8f, 0.4f, 1.0f));
+            }
+            if (ImGui::Button(click_to_pose_active ? "Click on Map..." : "Click on Map", ImVec2(-1, 25))) {
+                click_to_pose_active = !click_to_pose_active;
+            }
+            if (click_to_pose_active) {
+                ImGui::PopStyleColor(2);
+            }
+            SetTooltip("Click on map to set position. Drag to set heading direction.");
+
+            // Set up/remove callback when mode changes
+            if (click_to_pose_active != was_active) {
+                if (click_to_pose_active) {
+                    g_localization_viewer->setMapClickCallback([](float x, float y, float heading) {
+                        hint_x = x;
+                        hint_y = y;
+                        if (!std::isnan(heading)) {
+                            hint_yaw = heading * 180.0f / 3.14159f;  // Convert to degrees
+                        }
+                        // Don't auto-disable - user can click again to refine
+                    });
+                    g_localization_viewer->setClickToPoseMode(true);
+                } else {
+                    g_localization_viewer->setMapClickCallback(nullptr);
+                    g_localization_viewer->setClickToPoseMode(false);
+                }
+            }
+
+            if (click_to_pose_active) {
+                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Click map to set position");
+            }
+        }
+
         ImGui::SetNextItemWidth(-1);
         ImGui::DragFloat("##HintX", &hint_x, 0.1f, -100.0f, 100.0f, "X: %.1f m");
         ImGui::SetNextItemWidth(-1);
         ImGui::DragFloat("##HintY", &hint_y, 0.1f, -100.0f, 100.0f, "Y: %.1f m");
         ImGui::SetNextItemWidth(-1);
         ImGui::DragFloat("##HintYaw", &hint_yaw, 1.0f, -180.0f, 180.0f, "Yaw: %.0f deg");
+    } else if (click_to_pose_active) {
+        // Disable click-to-pose if hint was unchecked
+        click_to_pose_active = false;
+        if (g_localization_viewer) {
+            g_localization_viewer->setMapClickCallback(nullptr);
+            g_localization_viewer->setClickToPoseMode(false);
+        }
     }
 
-    bool can_relocalize = (state == AppState::MAP_LOADED || state == AppState::RELOCALIZE_FAILED);
+    // Allow relocalize from MAP_LOADED, RELOCALIZE_FAILED, OPERATING, or MAPPING (auto-switch)
+    bool can_relocalize = (state == AppState::MAP_LOADED || state == AppState::RELOCALIZE_FAILED ||
+                          state == AppState::OPERATING || state == AppState::MAPPING);
     ImGui::BeginDisabled(!can_relocalize);
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.5f, 0.7f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.6f, 0.8f, 1.0f));
     if (ImGui::Button("Relocalize", ImVec2(-1, 40))) {
+        // Auto-stop current mode if needed
+        if (state == AppState::OPERATING) {
+            g_commands.push(Command::simple(CommandType::STOP_OPERATING));
+        } else if (state == AppState::MAPPING) {
+            g_commands.push(Command::simple(CommandType::STOP_MAPPING));
+        }
         if (use_pose_hint) {
             g_commands.push(Command::poseHint(hint_x, hint_y, hint_yaw));
         }
@@ -2938,8 +3913,49 @@ void DrawLocalizationTab() {
             }
         }
 
+        // Show "Localize Now" button when ready
+        if (reloc.ready_to_localize && !reloc.icp_running) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
+                "Coverage sufficient! Stop robot before continuing.");
+            ImGui::Spacing();
+
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.8f, 0.4f, 1.0f));
+            if (ImGui::Button("Localize Now", ImVec2(-1, 40))) {
+                g_commands.push(Command::simple(CommandType::RUN_GLOBAL_LOCALIZATION));
+            }
+            ImGui::PopStyleColor(2);
+            SetTooltip("Run global ICP alignment. Robot should be stationary.");
+        }
+
+        // Show ICP progress when running
+        if (reloc.icp_running) {
+            ImGui::Spacing();
+            ImGui::Text("Stage: %s", reloc.icp_stage.c_str());
+            ImGui::ProgressBar(reloc.icp_progress, ImVec2(-1, 20));
+
+            if (reloc.icp_hypotheses > 0) {
+                ImGui::Text("Hypotheses: %d kept of %d", reloc.icp_kept, reloc.icp_hypotheses);
+            }
+            if (reloc.icp_max_iterations > 0) {
+                ImGui::Text("Iteration: %d/%d", reloc.icp_iteration, reloc.icp_max_iterations);
+            }
+            if (reloc.icp_fitness > 0) {
+                ImGui::Text("Fitness: %.1f%%", reloc.icp_fitness * 100.0f);
+            }
+
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.3f, 0.2f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.4f, 0.3f, 1.0f));
+            if (ImGui::Button("Cancel", ImVec2(-1, 30))) {
+                g_commands.push(Command::simple(CommandType::CANCEL_GLOBAL_LOCALIZATION));
+            }
+            ImGui::PopStyleColor(2);
+        }
+
         // Show attempt info if attempting
-        if (!reloc.accumulating && reloc.attempt_number > 0) {
+        if (!reloc.accumulating && !reloc.icp_running && reloc.attempt_number > 0) {
             ImGui::Text("Attempt: %d", reloc.attempt_number);
         }
     } else if (state == AppState::LOCALIZED) {
@@ -2964,15 +3980,34 @@ void DrawLocalizationTab() {
     ImGui::Separator();
     ImGui::Spacing();
 
+    // Restart button (appears when localized or failed)
+    bool can_restart = (state == AppState::LOCALIZED || state == AppState::RELOCALIZE_FAILED);
+    if (can_restart) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.4f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.6f, 0.5f, 0.3f, 1.0f));
+        if (ImGui::Button("Re-localize", ImVec2(-1, 30))) {
+            // Stop current localization and restart
+            g_commands.push(Command::simple(CommandType::STOP_LOCALIZATION));
+            g_commands.push(Command::simple(CommandType::RELOCALIZE));
+        }
+        SetTooltip("Stop current localization and start fresh from the beginning.");
+        ImGui::PopStyleColor(2);
+    }
+
     // Stop/Cancel button
     bool can_stop = (state == AppState::LOCALIZED || state == AppState::RELOCALIZING);
     ImGui::BeginDisabled(!can_stop);
     const char* stop_text = (state == AppState::RELOCALIZING) ? "Cancel" : "Stop Localization";
+    ImVec4 stop_color = (state == AppState::RELOCALIZING) ?
+        ImVec4(0.8f, 0.5f, 0.2f, 1.0f) : ImVec4(0.7f, 0.2f, 0.2f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, stop_color);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(stop_color.x + 0.1f, stop_color.y + 0.1f, stop_color.z + 0.1f, 1.0f));
     if (ImGui::Button(stop_text, ImVec2(-1, 30))) {
         g_commands.push(Command::simple(CommandType::STOP_LOCALIZATION));
     }
     SetTooltip(state == AppState::RELOCALIZING ?
         "Cancel localization process" : "Stop localization and return to idle.");
+    ImGui::PopStyleColor(2);
     ImGui::EndDisabled();
 
     ImGui::EndChild();
@@ -3031,6 +4066,9 @@ void DrawCalibrationTab() {
 
         ImGui::Spacing();
         if (ImGui::Button("Cancel", ImVec2(100, 30))) {
+            // Set flag directly for immediate response (bypasses command queue)
+            g_calibration_cancel.store(true);
+            // Also push command to handle state transition after calibration stops
             g_commands.push(Command::simple(CommandType::CANCEL_CALIBRATION));
         }
     }
@@ -3429,6 +4467,16 @@ void DrawSettingsTab() {
         ImGui::SliderInt("Max Iterations", &g_config.max_iterations, 1, 6);
         SetTooltip("IEKF iterations per scan. (Requires restart)");
 
+        ImGui::SliderInt("Max Points ICP", &g_config.max_points_icp, 500, 5000);
+        SetTooltip("CRITICAL: Max points for IEKF matching. Lower = faster. 2000 recommended. (Requires restart)");
+
+        // Display in K for readability
+        int max_map_k = g_config.max_map_points / 1000;
+        if (ImGui::SliderInt("Max Map Points (K)", &max_map_k, 100, 2000)) {
+            g_config.max_map_points = max_map_k * 1000;
+        }
+        SetTooltip("Max points in map. Prevents ikd-tree slowdown at large maps. 500K recommended. (Requires restart)");
+
         ImGui::SliderFloat("Gyro Covariance", &g_config.gyr_cov, 0.01f, 1.0f, "%.2f");
         SetTooltip("IMU gyroscope noise covariance. Applied when mapping starts.");
 
@@ -3444,6 +4492,15 @@ void DrawSettingsTab() {
     // Viewer settings
     if (ImGui::CollapsingHeader("3D Viewer", ImGuiTreeNodeFlags_DefaultOpen)) {
         static bool viewer_changed = false;
+
+        // Performance test toggle - prominent at top
+        ImGui::PushStyleColor(ImGuiCol_Text, g_config.disable_map_viewer ?
+            ImVec4(1.0f, 0.3f, 0.3f, 1.0f) : ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+        ImGui::Checkbox("Disable Map Viewer", &g_config.disable_map_viewer);
+        ImGui::PopStyleColor();
+        SetTooltip("Disable all map visualization updates. Use to test SLAM performance without viewer overhead.");
+
+        ImGui::Separator();
 
         ImGui::SliderFloat("Point Size", &g_config.viewer_point_size, 1.0f, 10.0f, "%.1f px");
         SetTooltip("Size of rendered points in pixels.");
@@ -3610,6 +4667,289 @@ void DrawMainWindow() {
         }
     }
 
+    // VESC Diagnostics popup
+    if (g_show_vesc_diagnostics) {
+        ImGui::OpenPopup("VESC Diagnostics");
+    }
+    if (ImGui::BeginPopupModal("VESC Diagnostics", &g_show_vesc_diagnostics, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("VESC Connection Diagnostics");
+        ImGui::Separator();
+
+        // Current settings
+        ImGui::Text("Current Settings:");
+        ImGui::BulletText("COM Port: %s", g_config.can_port);
+        ImGui::BulletText("Left VESC ID: %d", g_config.vesc_left_id);
+        ImGui::BulletText("Right VESC ID: %d", g_config.vesc_right_id);
+        ImGui::Spacing();
+
+        // Run diagnostics button - sets flag for ControlThread to process
+        // (Single-thread VESC architecture: all VESC operations in ControlThread)
+        if (!g_vesc_diag_running && !g_vesc_diag_requested.load()) {
+            if (ImGui::Button("Run Diagnostics", ImVec2(150, 30))) {
+                // Just set the flag - ControlThread will process it
+                g_vesc_diag_requested.store(true);
+            }
+        } else {
+            ImGui::Text("Running diagnostics...");
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        // Diagnostic log
+        if (!g_vesc_diag_log.empty()) {
+            ImGui::Text("Results:");
+            ImGui::BeginChild("DiagLog", ImVec2(400, 200), true);
+            ImGui::TextUnformatted(g_vesc_diag_log.c_str());
+            ImGui::EndChild();
+        }
+
+        // Tips
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Troubleshooting Tips:");
+        ImGui::BulletText("Unplug and replug CANable to reset");
+        ImGui::BulletText("Check CAN bus termination (120 ohm)");
+        ImGui::BulletText("Verify VESC IDs match in Settings tab");
+        ImGui::BulletText("Ensure battery is connected to VESCs");
+
+        ImGui::Spacing();
+        if (ImGui::Button("Close", ImVec2(100, 30))) {
+            g_show_vesc_diagnostics = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    // LiDAR Diagnostics popup
+    if (g_show_lidar_diagnostics) {
+        ImGui::OpenPopup("LiDAR Diagnostics");
+    }
+    if (ImGui::BeginPopupModal("LiDAR Diagnostics", &g_show_lidar_diagnostics, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("LiDAR Connection Diagnostics");
+        ImGui::Separator();
+
+        // Current settings
+        ImGui::Text("Current Settings:");
+        ImGui::BulletText("LiDAR IP: %s", g_config.lidar_ip);
+        ImGui::BulletText("Host IP: %s", g_config.host_ip);
+        ImGui::Spacing();
+
+        // Current status
+        ImGui::Text("Current Status:");
+        bool has_instance = (g_lidar != nullptr);
+        bool is_streaming = has_instance && g_lidar->isStreaming();
+        LidarStatus status = g_shared.getLidarStatus();
+        bool is_connected = (status.connection == ConnectionStatus::CONNECTED);
+
+        if (is_streaming) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "  Status: Streaming data");
+            ImGui::BulletText("Point rate: %d pts/s", status.point_rate);
+            ImGui::BulletText("IMU rate: %d Hz", status.imu_rate);
+        } else if (is_connected) {
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.2f, 1.0f), "  Status: Connected but NOT streaming");
+            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "  LiDAR may be powered off or in standby");
+        } else {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "  Status: Disconnected");
+        }
+        ImGui::Spacing();
+
+        // Run diagnostics button
+        if (!g_lidar_diag_running) {
+            if (ImGui::Button("Run Diagnostics", ImVec2(150, 30))) {
+                g_lidar_diag_running = true;
+                g_lidar_diag_log.clear();
+                g_lidar_diag_log += "=== LiDAR Diagnostics ===\n\n";
+
+                // Step 1: Ping the LiDAR IP
+                g_lidar_diag_log += "1. Network Connectivity:\n";
+                std::string ping_cmd = "ping -n 1 -w 1000 " + std::string(g_config.lidar_ip);
+                FILE* pipe = _popen(ping_cmd.c_str(), "r");
+                if (pipe) {
+                    char buffer[256];
+                    std::string ping_output;
+                    while (fgets(buffer, sizeof(buffer), pipe)) {
+                        ping_output += buffer;
+                    }
+                    int result = _pclose(pipe);
+                    if (result == 0) {
+                        g_lidar_diag_log += "   [OK] Ping to " + std::string(g_config.lidar_ip) + " successful\n";
+                    } else {
+                        g_lidar_diag_log += "   [FAIL] Cannot ping " + std::string(g_config.lidar_ip) + "\n";
+                        g_lidar_diag_log += "   -> Check LiDAR power cable\n";
+                        g_lidar_diag_log += "   -> Check Ethernet connection\n";
+                        g_lidar_diag_log += "   -> Verify IP address in Settings\n";
+                    }
+                } else {
+                    g_lidar_diag_log += "   [ERROR] Could not run ping command\n";
+                }
+
+                // Step 2: Check host IP configuration
+                g_lidar_diag_log += "\n2. Host Network Configuration:\n";
+                std::string host_ip = g_config.host_ip;
+                // Check if host IP is in same subnet as LiDAR
+                std::string lidar_subnet = std::string(g_config.lidar_ip).substr(0, std::string(g_config.lidar_ip).rfind('.'));
+                std::string host_subnet = host_ip.substr(0, host_ip.rfind('.'));
+                if (lidar_subnet == host_subnet) {
+                    g_lidar_diag_log += "   [OK] Host IP (" + host_ip + ") in same subnet as LiDAR\n";
+                } else {
+                    g_lidar_diag_log += "   [WARN] Host IP (" + host_ip + ") may be in different subnet\n";
+                    g_lidar_diag_log += "   -> LiDAR subnet: " + lidar_subnet + ".x\n";
+                    g_lidar_diag_log += "   -> Configure network adapter to " + lidar_subnet + ".x\n";
+                }
+
+                // Step 3: Try to connect and stream
+                g_lidar_diag_log += "\n3. LiDAR Connection Test:\n";
+                if (!g_lidar) {
+                    g_lidar = std::make_unique<slam::LivoxMid360>();
+                    g_lidar->setPointCloudCallback(OnPointCloud);
+                    g_lidar->setIMUCallback(OnIMU);
+                    g_lidar_diag_log += "   Created new LiDAR instance\n";
+                } else {
+                    g_lidar_diag_log += "   Using existing LiDAR instance\n";
+                }
+
+                if (g_lidar->isStreaming()) {
+                    g_lidar_diag_log += "   [OK] Already streaming!\n";
+                } else {
+                    g_lidar_diag_log += "   Attempting connection...\n";
+                    if (g_lidar->connect(g_config.lidar_ip, g_config.host_ip)) {
+                        g_lidar_diag_log += "   [OK] Connection command sent\n";
+
+                        // Wait for streaming to start
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+                        if (g_lidar->isStreaming()) {
+                            g_lidar_diag_log += "   [OK] LiDAR is now streaming!\n";
+                            LidarStatus new_status = g_shared.getLidarStatus();
+                            char buf[128];
+                            snprintf(buf, sizeof(buf), "   Point rate: %d pts/s, IMU rate: %d Hz\n",
+                                     new_status.point_rate, new_status.imu_rate);
+                            g_lidar_diag_log += buf;
+                        } else {
+                            g_lidar_diag_log += "   [FAIL] Connected but no data streaming\n";
+                            g_lidar_diag_log += "   -> LiDAR may not be powered (only network chip active)\n";
+                            g_lidar_diag_log += "   -> Check the power LED on the LiDAR\n";
+                            g_lidar_diag_log += "   -> Try power cycling the LiDAR\n";
+                        }
+                    } else {
+                        g_lidar_diag_log += "   [FAIL] Connection failed\n";
+                        g_lidar_diag_log += "   -> Check firewall settings (UDP ports 56000-56100)\n";
+                        g_lidar_diag_log += "   -> Try disabling Windows Firewall temporarily\n";
+                    }
+                }
+
+                g_lidar_diag_log += "\n=== Diagnostics Complete ===\n";
+                g_lidar_diag_running = false;
+            }
+        } else {
+            ImGui::Text("Running diagnostics...");
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        // Diagnostic log
+        if (!g_lidar_diag_log.empty()) {
+            ImGui::Text("Results:");
+            ImGui::BeginChild("LidarDiagLog", ImVec2(450, 250), true);
+            ImGui::TextUnformatted(g_lidar_diag_log.c_str());
+            ImGui::EndChild();
+        }
+
+        // Tips
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Troubleshooting Tips:");
+        ImGui::BulletText("Green = streaming, Yellow = connected but no data");
+        ImGui::BulletText("If yellow: LiDAR chip has power but motor may be off");
+        ImGui::BulletText("Check power LED on LiDAR unit itself");
+        ImGui::BulletText("Try power cycling the LiDAR (wait 10s after power-on)");
+        ImGui::BulletText("Ensure host network adapter is set to %s", g_config.host_ip);
+
+        ImGui::Spacing();
+        if (ImGui::Button("Close", ImVec2(100, 30))) {
+            g_show_lidar_diagnostics = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    // System Log popup
+    if (g_show_system_log) {
+        ImGui::OpenPopup("System Log");
+    }
+    if (ImGui::BeginPopupModal("System Log", &g_show_system_log, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("System Error/Warning Log");
+        ImGui::Separator();
+
+        // Filter options
+        static bool show_info = true;
+        static bool show_warnings = true;
+        static bool show_errors = true;
+        ImGui::Checkbox("Info", &show_info);
+        ImGui::SameLine();
+        ImGui::Checkbox("Warnings", &show_warnings);
+        ImGui::SameLine();
+        ImGui::Checkbox("Errors", &show_errors);
+        ImGui::SameLine(300);
+        if (ImGui::Button("Clear Log")) {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            g_system_log.clear();
+        }
+        ImGui::Spacing();
+
+        // Log display
+        ImGui::BeginChild("LogContent", ImVec2(600, 400), true, ImGuiWindowFlags_HorizontalScrollbar);
+        {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            for (auto it = g_system_log.rbegin(); it != g_system_log.rend(); ++it) {
+                const auto& entry = *it;
+
+                // Filter by level
+                if (entry.level == LogLevel::INFO && !show_info) continue;
+                if (entry.level == LogLevel::WARNING && !show_warnings) continue;
+                if (entry.level == LogLevel::ERROR_LEVEL && !show_errors) continue;
+
+                // Format timestamp
+                auto time_t = std::chrono::system_clock::to_time_t(entry.timestamp);
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    entry.timestamp.time_since_epoch()) % 1000;
+                struct tm* tm_info = localtime(&time_t);
+                char time_str[32];
+                snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
+                         tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec, (int)ms.count());
+
+                // Color by level
+                ImVec4 color;
+                const char* level_str;
+                switch (entry.level) {
+                    case LogLevel::ERROR_LEVEL:
+                        color = ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+                        level_str = "ERROR";
+                        break;
+                    case LogLevel::WARNING:
+                        color = ImVec4(1.0f, 0.8f, 0.2f, 1.0f);
+                        level_str = "WARN ";
+                        break;
+                    default:
+                        color = ImVec4(0.7f, 0.7f, 0.7f, 1.0f);
+                        level_str = "INFO ";
+                        break;
+                }
+
+                ImGui::TextColored(color, "[%s] [%s] [%s] %s",
+                                   time_str, level_str, entry.source.c_str(), entry.message.c_str());
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        if (ImGui::Button("Close", ImVec2(100, 30))) {
+            g_show_system_log = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
     ImGui::End();
 }
 
@@ -3617,6 +4957,9 @@ void DrawMainWindow() {
 // Main Entry Point
 //==============================================================================
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    // Log application startup
+    LOG_INFO("System", "SLAM Control GUI starting...");
+
     // Get executable directory
     char exePath[MAX_PATH];
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -3625,7 +4968,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     // Load saved settings (before anything else)
     if (LoadSettings()) {
-        // Settings loaded successfully
+        LOG_INFO("System", "Settings loaded successfully");
+    } else {
+        LOG_INFO("System", "Using default settings");
     }
 
     // Create window

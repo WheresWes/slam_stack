@@ -78,11 +78,22 @@ struct RelocalizationProgress {
 
     // Progressive localization coverage metrics
     bool accumulating = false;      // True while building local map
+    bool ready_to_localize = false; // True when coverage is sufficient (robot should stop)
+    bool icp_running = false;       // True while ICP is running
     int local_map_voxels = 0;       // Voxels in local FAST-LIO map
     int local_map_points = 0;       // Points in local map
     float rotation_deg = 0.0f;      // Total rotation from start
     float distance_m = 0.0f;        // Total distance traveled
     int attempt_number = 0;         // Current attempt count
+
+    // ICP progress (when icp_running is true)
+    std::string icp_stage;          // Current ICP stage name
+    float icp_progress = 0.0f;      // 0.0-1.0 overall ICP progress
+    float icp_fitness = 0.0f;       // Current fitness score
+    int icp_hypotheses = 0;         // Total hypotheses generated
+    int icp_kept = 0;               // Hypotheses kept after filtering
+    int icp_iteration = 0;          // Current iteration in stage
+    int icp_max_iterations = 0;     // Max iterations for current stage
 
     // Thresholds for UI feedback
     static constexpr int MIN_VOXELS = 400;

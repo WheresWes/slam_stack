@@ -658,6 +658,11 @@ public:
     // Robot pose visualization
     void setRobotPose(float x, float y, float heading);
 
+    // Click-to-pose
+    void setMapClickCallback(SlamViewer::MapClickCallback callback);
+    void setClickToPoseMode(bool enabled);
+    bool isClickToPoseMode() const { return clickToPoseMode_; }
+
     // Stats
     SlamViewer::RenderStats getStats() const;
 
@@ -841,6 +846,13 @@ private:
     float robotHeading_ = 0.0f;
     bool showRobot_ = false;
     ComPtr<ID3D11Buffer> robotVertexBuffer_;
+
+    // Click-to-pose mode
+    bool clickToPoseMode_ = false;
+    SlamViewer::MapClickCallback mapClickCallback_;
+    bool clickDragActive_ = false;
+    float clickStartWorldX_ = 0.0f;
+    float clickStartWorldY_ = 0.0f;
 };
 
 } // namespace viz

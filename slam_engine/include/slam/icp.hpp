@@ -390,7 +390,81 @@ public:
     void setConfig(const ICPConfig& config) { config_ = config; }
     const ICPConfig& getConfig() const { return config_; }
 
+    /**
+     * @brief Run a single ICP iteration (for progress reporting)
+     *
+     * This maintains internal state between calls. The first call initializes
+     * the iteration, subsequent calls continue from previous state.
+     *
+     * @param source Source points to transform
+     * @param target Target points (reference)
+     * @param current_transform Current transformation estimate
+     * @return Result after this iteration (use converged flag to check completion)
+     */
+    ICPResult alignOneIteration(const std::vector<V3D>& source,
+                                const std::vector<V3D>& target,
+                                const M4D& current_transform) {
+        ICPResult result;
+        result.transformation = current_transform;
+
+        if (source.empty() || target.empty()) {
+            result.converged = true;
+            return result;
+        }
+
+        // Transform source points
+        std::vector<V3D> transformed_source;
+        transformed_source.reserve(source.size());
+        M3D R = current_transform.block<3, 3>(0, 0);
+        V3D t = current_transform.block<3, 1>(0, 3);
+        for (const auto& pt : source) {
+            transformed_source.push_back(R * pt + t);
+        }
+
+        // Find correspondences
+        std::vector<std::pair<int, int>> correspondences;
+        std::vector<double> distances;
+        findCorrespondences(transformed_source, target, correspondences, distances);
+
+        if (correspondences.size() < 10) {
+            result.converged = true;  // Can't continue, treat as converged
+            result.fitness_score = 0.0;
+            return result;
+        }
+
+        // Compute metrics
+        result.num_inliers = static_cast<int>(correspondences.size());
+        result.fitness_score = static_cast<double>(result.num_inliers) / source.size();
+
+        double sum_sq_error = 0;
+        for (double d : distances) {
+            sum_sq_error += d * d;
+        }
+        result.rmse = std::sqrt(sum_sq_error / distances.size());
+
+        // Check convergence against previous error
+        if (std::abs(prev_error_ - result.rmse) < config_.convergence_threshold) {
+            result.converged = true;
+        }
+        prev_error_ = result.rmse;
+
+        // Compute transformation update
+        M4D delta_T = computePointToPointTransform(transformed_source, target, correspondences);
+        result.transformation = delta_T * current_transform;
+        result.num_iterations = 1;
+
+        return result;
+    }
+
+    /**
+     * @brief Reset internal state for alignOneIteration
+     */
+    void resetIterationState() {
+        prev_error_ = std::numeric_limits<double>::max();
+    }
+
 private:
+    double prev_error_ = std::numeric_limits<double>::max();
     ICPConfig config_;
 
     //=========================================================================

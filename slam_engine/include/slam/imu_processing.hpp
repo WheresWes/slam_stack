@@ -368,13 +368,18 @@ inline void ImuProcessor::undistortPointCloud(
     const double pcl_beg_time = meas.lidar_beg_time;
     const double pcl_end_time = meas.lidar_end_time;
 
-    // Copy and sort point cloud by time offset
+    // Copy point cloud
     pcl_out = *meas.lidar;
 
-    std::sort(pcl_out.points.begin(), pcl_out.points.end(),
-              [](const LidarPoint& a, const LidarPoint& b) {
-                  return a.time_offset_ms < b.time_offset_ms;
-              });
+    // PERFORMANCE FIX: Only sort if not already sorted
+    // Livox driver typically provides points in time order, so this check
+    // saves O(n log n) sort cost in most cases (is_sorted is O(n))
+    auto time_compare = [](const LidarPoint& a, const LidarPoint& b) {
+        return a.time_offset_ms < b.time_offset_ms;
+    };
+    if (!std::is_sorted(pcl_out.points.begin(), pcl_out.points.end(), time_compare)) {
+        std::sort(pcl_out.points.begin(), pcl_out.points.end(), time_compare);
+    }
 
     // Initialize IMU pose buffer
     state_ikfom imu_state = kf_state.get_x();

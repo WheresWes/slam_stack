@@ -1629,7 +1629,9 @@ inline std::vector<WorldPoint> SlamEngine::getMapPoints() const {
     PointVector storage;
     ikdtree_.flatten(ikdtree_.Root_Node, storage, NOT_RECORD);
 
-    // DEBUG: Analyze point distribution
+#ifndef NDEBUG
+    // DEBUG: Analyze point distribution (disabled in release builds)
+    // This loop calculates sqrt for 500k+ points - expensive!
     double max_dist = 0;
     int far_count = 0;
     int nan_count = 0;
@@ -1648,6 +1650,7 @@ inline std::vector<WorldPoint> SlamEngine::getMapPoints() const {
                   << ", far(>50m)=" << far_count
                   << ", nan=" << nan_count << std::endl;
     }
+#endif
 
     points.reserve(storage.size());
     for (const auto& pt : storage) {

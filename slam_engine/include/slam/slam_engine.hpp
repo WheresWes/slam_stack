@@ -928,17 +928,19 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
     auto imu_end = std::chrono::high_resolution_clock::now();
     debug_timing_.imu_process_us = std::chrono::duration<double, std::micro>(imu_end - imu_start).count();
 
-    // Convert back to PCL for rest of processing
-    feats_undistort_->clear();
-    feats_undistort_->reserve(pcl_undistort->size());
-    for (const auto& pt : pcl_undistort->points) {
-        PointType pcl_pt;
-        pcl_pt.x = pt.x;
-        pcl_pt.y = pt.y;
-        pcl_pt.z = pt.z;
-        pcl_pt.intensity = pt.intensity;  // PRESERVE INTENSITY
-        pcl_pt.curvature = pt.time_offset_ms;
-        feats_undistort_->push_back(pcl_pt);
+    // PERFORMANCE FIX: Convert to PCL format using resize + direct indexing
+    // instead of clear + reserve + push_back (avoids per-element capacity checks)
+    const size_t num_points = pcl_undistort->size();
+    feats_undistort_->resize(num_points);
+
+    for (size_t i = 0; i < num_points; i++) {
+        const auto& pt = pcl_undistort->points[i];
+        auto& out = feats_undistort_->points[i];
+        out.x = pt.x;
+        out.y = pt.y;
+        out.z = pt.z;
+        out.intensity = pt.intensity;
+        out.curvature = pt.time_offset_ms;
     }
 
     state_point_ = kf_.get_x();

@@ -1413,6 +1413,13 @@ inline void SlamEngine::hShareModel(state_ikfom& s,
     corr_normvect_->clear();
     double total_residual = 0.0;
 
+    // PERFORMANCE FIX: Cache rotation matrices once per hShareModel call
+    // Previously these were computed per-point (~5000x), now computed once
+    const M3D R_world = s.rot.toRotationMatrix();
+    const M3D R_L_I = s.offset_R_L_I.toRotationMatrix();
+    const V3D T_L_I(s.offset_T_L_I[0], s.offset_T_L_I[1], s.offset_T_L_I[2]);
+    const V3D pos(s.pos[0], s.pos[1], s.pos[2]);
+
     // Find correspondences and compute residuals
     #ifdef MP_EN
     omp_set_num_threads(4);
@@ -1422,19 +1429,18 @@ inline void SlamEngine::hShareModel(state_ikfom& s,
         PointType& point_body = feats_down_body_->points[i];
         PointType& point_world = feats_down_world_->points[i];
 
-        // Transform to world frame
+        // Transform to world frame (using cached matrices)
         V3D p_body(point_body.x, point_body.y, point_body.z);
-        V3D p_global = s.rot.toRotationMatrix() *
-                       (s.offset_R_L_I.toRotationMatrix() * p_body +
-                        V3D(s.offset_T_L_I[0], s.offset_T_L_I[1], s.offset_T_L_I[2])) +
-                       V3D(s.pos[0], s.pos[1], s.pos[2]);
+        V3D p_global = R_world * (R_L_I * p_body + T_L_I) + pos;
 
         point_world.x = p_global(0);
         point_world.y = p_global(1);
         point_world.z = p_global(2);
         point_world.intensity = point_body.intensity;
 
-        std::vector<float> point_search_sq_dis(NUM_MATCH_POINTS);
+        // PERFORMANCE FIX: Use thread_local storage to avoid allocation per point
+        // Each OpenMP thread gets its own vector, allocated once and reused
+        thread_local std::vector<float> point_search_sq_dis(NUM_MATCH_POINTS);
         auto& points_near = nearest_points_[i];
 
         if (ekfom_data.converge) {
@@ -1511,6 +1517,11 @@ inline void SlamEngine::hShareModel(state_ikfom& s,
     }
 
     // Build measurement Jacobian
+    // PERFORMANCE FIX: Reuse cached rotation matrices (R_world, R_L_I already computed above)
+    // Also precompute transposes to avoid per-point transpose operations
+    const M3D R_world_T = R_world.transpose();
+    const M3D R_L_I_T = R_L_I.transpose();
+
     ekfom_data.h_x = Eigen::MatrixXd::Zero(effct_feat_num_, 12);
     ekfom_data.h.resize(effct_feat_num_);
 
@@ -1519,18 +1530,17 @@ inline void SlamEngine::hShareModel(state_ikfom& s,
         V3D point_this_be(laser_p.x, laser_p.y, laser_p.z);
         M3D point_be_crossmat = skew_sym_mat(point_this_be);
 
-        V3D point_this = s.offset_R_L_I.toRotationMatrix() * point_this_be +
-                         V3D(s.offset_T_L_I[0], s.offset_T_L_I[1], s.offset_T_L_I[2]);
+        V3D point_this = R_L_I * point_this_be + T_L_I;
         M3D point_crossmat = skew_sym_mat(point_this);
 
         const PointType& norm_p = corr_normvect_->points[i];
         V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
 
-        V3D C = s.rot.toRotationMatrix().transpose() * norm_vec;
+        V3D C = R_world_T * norm_vec;
         V3D A = point_crossmat * C;
 
         if (config_.extrinsic_est_en) {
-            V3D B = point_be_crossmat * s.offset_R_L_I.toRotationMatrix().transpose() * C;
+            V3D B = point_be_crossmat * R_L_I_T * C;
             ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z,
                 A(0), A(1), A(2), B(0), B(1), B(2), C(0), C(1), C(2);
         } else {

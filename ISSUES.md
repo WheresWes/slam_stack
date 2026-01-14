@@ -1,5 +1,35 @@
 # SLAM Stack - Known Issues and TODO
 
+## Critical
+
+### 0. SLAM Flyaway Issue (Pose Divergence)
+**Status**: Active investigation
+**Description**: SLAM pose suddenly diverges ("flies away") even when processing time is acceptable.
+
+**Symptoms:**
+- Pose suddenly jumps to incorrect location
+- Often occurs after extended mapping session
+- Can happen even with SLAM time < 50ms
+- Map becomes corrupted after flyaway
+
+**Potential causes under investigation:**
+- [ ] IEKF not converging (insufficient iterations?)
+- [ ] Degenerate geometry (insufficient plane constraints)
+- [ ] Numerical instability in covariance update
+- [ ] Point-to-plane residual outliers not rejected
+- [ ] IMU propagation error accumulation
+- [ ] ikd-tree nearest neighbor errors at map boundaries
+- [ ] State covariance growing unbounded
+
+**Comparison with FAST-LIO needed:**
+- [ ] IEKF convergence criteria
+- [ ] Residual outlier rejection
+- [ ] Covariance bounds/reset
+- [ ] Point plane fitting validity checks
+- [ ] IMU bias estimation stability
+
+---
+
 ## High Priority
 
 ### 1. Calibration Process Overhaul

@@ -6,6 +6,7 @@
 None yet - starting fresh.
 
 ## Baseline Performance (no hint)
+- Map: house.ply (58866 points, ~12.6m x 13.3m house)
 - Grid search generates 503M+ hypotheses for house map
 - Completely impractical without hint
 - With hint (10m radius): works but slow (~30s+)

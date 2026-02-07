@@ -23,7 +23,7 @@ bash ralph/test_localization.sh
 cd slam_stack/build/Release
 ./replay_localization.exe \
     --input "C:/Users/wmuld/OneDrive/Desktop/Documents/ATLASCpp/loc_session_20260207_141500.bin" \
-    --map "C:/Users/wmuld/OneDrive/Desktop/Documents/ATLASCpp/map.ply" \
+    --map "C:/Users/wmuld/OneDrive/Desktop/Documents/ATLASCpp/house.ply" \
     --no-hint --max-time 60 --json --verbose
 ```
 

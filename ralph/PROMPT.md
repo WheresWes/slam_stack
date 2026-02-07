@@ -37,8 +37,9 @@ C:\Users\wmuld\OneDrive\Desktop\Documents\ATLASCpp\loc_session_20260207_141500.b
 
 ### Pre-built Map
 ```
-C:\Users\wmuld\OneDrive\Desktop\Documents\ATLASCpp\map.ply (439KB, 28037 points)
-Map bounds: [-2.6m, -0.08m] to [10.0m, 13.2m] (house-scale, ~12.6m x 13.3m)
+C:\Users\wmuld\OneDrive\Desktop\Documents\ATLASCpp\house.ply (920KB, 58866 points)
+Map bounds: house-scale (~12.6m x 13.3m)
+Note: This is the primary map. Recordings were made in this house.
 ```
 
 ### Test Harness
@@ -49,7 +50,7 @@ bash ralph/test_localization.sh
 # Test single recording:
 ./build/Release/replay_localization.exe \
     --input "C:\Users\wmuld\OneDrive\Desktop\Documents\ATLASCpp\loc_session_20260207_141500.bin" \
-    --map "C:\Users\wmuld\OneDrive\Desktop\Documents\ATLASCpp\map.ply" \
+    --map "C:\Users\wmuld\OneDrive\Desktop\Documents\ATLASCpp\house.ply" \
     --no-hint --max-time 60 --json --verbose
 ```
 

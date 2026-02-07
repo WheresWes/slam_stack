@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 RECORDINGS_DIR="C:/Users/wmuld/OneDrive/Desktop/Documents/ATLASCpp"
-MAP_FILE="$RECORDINGS_DIR/map.ply"
+MAP_FILE="$RECORDINGS_DIR/house.ply"
 RESULTS_DIR="$SCRIPT_DIR/results"
 REPLAY_EXE="$BUILD_DIR/Release/replay_localization.exe"
 

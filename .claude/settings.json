@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(MSBuild*)",
+      "Bash(cd*&&*MSBuild*)",
+      "Bash(*replay_localization*)",
+      "Bash(bash ralph/*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(ls*)",
+      "Bash(mkdir*)",
+      "Bash(cat*)",
+      "Bash(head*)",
+      "Bash(tail*)",
+      "Bash(wc*)"
+    ],
+    "deny": [
+      "Bash(git push*)",
+      "Bash(git reset*)",
+      "Bash(rm -rf*)",
+      "Bash(del*)"
+    ]
+  }
+}

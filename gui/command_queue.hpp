@@ -70,6 +70,8 @@ struct PoseHintCommand {
     float x = 0.0f;
     float y = 0.0f;
     float theta_deg = 0.0f;
+    float search_radius_m = 10.0f;  // Search radius around hint position
+    bool heading_known = false;     // If true, use theta_deg; if false, search all angles
 };
 
 struct FileCommand {
@@ -95,8 +97,10 @@ struct Command {
         return Command{CommandType::SET_VELOCITY, VelocityCommand{linear, angular}};
     }
 
-    static Command poseHint(float x, float y, float theta_deg) {
-        return Command{CommandType::SET_POSE_HINT, PoseHintCommand{x, y, theta_deg}};
+    static Command poseHint(float x, float y, float theta_deg,
+                            float search_radius_m = 10.0f, bool heading_known = false) {
+        return Command{CommandType::SET_POSE_HINT,
+                       PoseHintCommand{x, y, theta_deg, search_radius_m, heading_known}};
     }
 
     static Command file(CommandType type, const std::string& path) {

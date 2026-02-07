@@ -230,7 +230,8 @@ public:
             return false;
         }
 
-        engine_.setInitialPose(result.pose);
+        // PRESERVE BIASES - IMU has been running during global localization
+        engine_.setInitialPose(result.pose, true);
         std::cout << "[GlobalLoc] Applied localization result. Confidence: "
                  << result.confidence.describe() << std::endl;
         return true;

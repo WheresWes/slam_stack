@@ -460,6 +460,14 @@ if(BUILD_EXAMPLES)
         slam_engine
     )
 
+    # Replay Localization Session (offline localization development)
+    add_executable(replay_localization
+        examples/replay_localization.cpp
+    )
+    target_link_libraries(replay_localization
+        slam_engine
+    )
+
     # Gamepad controller test (requires SDL2)
     if(HAS_SDL2)
         add_executable(test_gamepad

@@ -21,6 +21,7 @@
 #endif
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d11.h>
 #include <tchar.h>
 #include <string>
@@ -57,6 +58,7 @@
 #include "slam/vesc_driver.hpp"
 #include "slam/sensor_fusion.hpp"
 #include "slam/motion_controller.hpp"
+#include "slam/localization_recording.hpp"
 #endif
 
 // GPU-accelerated viewer
@@ -237,6 +239,18 @@ static slam::DriveCommand g_drive_cmd;  // Computed by getDriveCommand()
 static float g_gamepad_left_x = 0.0f;   // For display only
 static float g_gamepad_left_y = 0.0f;   // For display only
 
+// Localization session recording
+static std::ofstream g_loc_recording_file;
+static std::mutex g_loc_recording_mutex;
+static std::chrono::steady_clock::time_point g_loc_recording_start;
+static std::string g_loaded_map_path;
+
+// Debug: arrow tracking log
+static std::ofstream g_arrow_debug_log;
+static int g_arrow_debug_counter = 0;
+static std::ofstream g_loop_debug_log;
+static int g_loop_debug_counter = 0;
+
 // UI state
 static int g_current_tab = 0;
 static bool g_show_calibration_popup = false;
@@ -247,6 +261,380 @@ static std::vector<std::string> g_available_maps;
 // Time tracking
 static auto g_start_time = std::chrono::steady_clock::now();
 static float g_current_time = 0.0f;
+
+//==============================================================================
+// Localization Hint System (for reliable global localization)
+//==============================================================================
+
+/**
+ * @brief Localization hint from user - defines bounded search region
+ *
+ * CRITICAL: Hint is REQUIRED for reliable localization. Without it,
+ * the system must search the entire map which is slow and unreliable.
+ */
+struct LocalizationHint {
+    bool valid = false;
+
+    // Position in map frame (set by clicking on map)
+    double x = 0.0;
+    double y = 0.0;
+
+    // Heading (set by dragging from click point)
+    bool heading_known = false;
+    double heading_rad = 0.0;          // 0 = +X axis, CCW positive
+    double heading_range_rad = M_PI / 3;  // ±60° if known, ±180° if unknown
+
+    // Search region
+    double search_radius_m = 10.0;     // Default 10m search radius
+
+    // Helper methods
+    double getMinX() const { return x - search_radius_m; }
+    double getMaxX() const { return x + search_radius_m; }
+    double getMinY() const { return y - search_radius_m; }
+    double getMaxY() const { return y + search_radius_m; }
+    double getMinHeading() const {
+        return heading_known ? (heading_rad - heading_range_rad) : -M_PI;
+    }
+    double getMaxHeading() const {
+        return heading_known ? (heading_rad + heading_range_rad) : M_PI;
+    }
+};
+
+/**
+ * @brief State for the 2D map overview widget
+ */
+struct MapOverviewState {
+    // View transform
+    double pan_x = 0.0;
+    double pan_y = 0.0;
+    double zoom = 1.0;
+
+    // Cached 2D projection of prebuilt map (for fast rendering)
+    struct Point2D {
+        float x, y;     // Position
+        uint8_t color;  // Grayscale intensity based on Z
+    };
+    std::vector<Point2D> map_points_2d;
+    bool cache_valid = false;
+
+    // Map bounds
+    double map_min_x = 0.0, map_max_x = 0.0;
+    double map_min_y = 0.0, map_max_y = 0.0;
+    double map_min_z = 0.0, map_max_z = 0.0;
+
+    // Interaction state
+    bool is_dragging = false;
+    double drag_start_x = 0.0;
+    double drag_start_y = 0.0;
+};
+
+// Global localization hint state
+static LocalizationHint g_loc_hint;
+static MapOverviewState g_map_overview;
+static bool g_hint_window_expanded = false;  // Full-size hint window mode
+static bool g_hide_local_map_overlay = true; // Hide local map during localization (default ON)
+
+/**
+ * @brief Build 2D cache from prebuilt map points
+ *
+ * Call this when a map is loaded to prepare for rendering.
+ */
+inline void buildMapOverviewCache(const std::vector<slam::WorldPoint>& points) {
+    g_map_overview.map_points_2d.clear();
+    g_map_overview.cache_valid = false;
+
+    if (points.empty()) return;
+
+    // Find bounds
+    g_map_overview.map_min_x = g_map_overview.map_max_x = points[0].x;
+    g_map_overview.map_min_y = g_map_overview.map_max_y = points[0].y;
+    g_map_overview.map_min_z = g_map_overview.map_max_z = points[0].z;
+
+    for (const auto& pt : points) {
+        g_map_overview.map_min_x = std::min(g_map_overview.map_min_x, (double)pt.x);
+        g_map_overview.map_max_x = std::max(g_map_overview.map_max_x, (double)pt.x);
+        g_map_overview.map_min_y = std::min(g_map_overview.map_min_y, (double)pt.y);
+        g_map_overview.map_max_y = std::max(g_map_overview.map_max_y, (double)pt.y);
+        g_map_overview.map_min_z = std::min(g_map_overview.map_min_z, (double)pt.z);
+        g_map_overview.map_max_z = std::max(g_map_overview.map_max_z, (double)pt.z);
+    }
+
+    // Downsample for efficient rendering (keep ~50k points max)
+    size_t max_points = 50000;
+    size_t step = std::max(size_t(1), points.size() / max_points);
+
+    double z_range = g_map_overview.map_max_z - g_map_overview.map_min_z;
+    if (z_range < 0.01) z_range = 1.0;  // Avoid division by zero
+
+    g_map_overview.map_points_2d.reserve(points.size() / step + 1);
+
+    for (size_t i = 0; i < points.size(); i += step) {
+        const auto& pt = points[i];
+        MapOverviewState::Point2D pt2d;
+        pt2d.x = pt.x;
+        pt2d.y = pt.y;
+        // Color by Z height (0-255 grayscale)
+        double z_norm = (pt.z - g_map_overview.map_min_z) / z_range;
+        pt2d.color = static_cast<uint8_t>(std::clamp(z_norm * 200 + 55, 55.0, 255.0));
+        g_map_overview.map_points_2d.push_back(pt2d);
+    }
+
+    // Reset view to fit map
+    g_map_overview.pan_x = 0.0;
+    g_map_overview.pan_y = 0.0;
+    g_map_overview.zoom = 1.0;
+    g_map_overview.cache_valid = true;
+
+    // Reset hint when new map loaded
+    g_loc_hint.valid = false;
+
+    std::cout << "[MapOverview] Cached " << g_map_overview.map_points_2d.size()
+              << " points for 2D view" << std::endl;
+}
+
+/**
+ * @brief Render the 2D map overview widget with hint selection
+ *
+ * Returns true if hint is valid (user has clicked on map)
+ */
+inline bool renderMapOverviewWidget(float widget_width, float widget_height) {
+    if (!g_map_overview.cache_valid || g_map_overview.map_points_2d.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "Load a map to see overview");
+        return false;
+    }
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+    ImVec2 canvas_size(widget_width, widget_height);
+
+    // Calculate view transform (map coords → screen coords)
+    double map_width = g_map_overview.map_max_x - g_map_overview.map_min_x;
+    double map_height = g_map_overview.map_max_y - g_map_overview.map_min_y;
+    if (map_width < 0.01) map_width = 1.0;
+    if (map_height < 0.01) map_height = 1.0;
+
+    double base_scale = std::min(canvas_size.x / map_width, canvas_size.y / map_height) * 0.9;
+    double scale = base_scale * g_map_overview.zoom;
+
+    double map_center_x = (g_map_overview.map_min_x + g_map_overview.map_max_x) / 2.0;
+    double map_center_y = (g_map_overview.map_min_y + g_map_overview.map_max_y) / 2.0;
+
+    auto mapToScreen = [&](double mx, double my) -> ImVec2 {
+        float sx = canvas_pos.x + canvas_size.x / 2.0f +
+                   (float)((mx - map_center_x + g_map_overview.pan_x) * scale);
+        float sy = canvas_pos.y + canvas_size.y / 2.0f -
+                   (float)((my - map_center_y + g_map_overview.pan_y) * scale);
+        return ImVec2(sx, sy);
+    };
+
+    auto screenToMap = [&](ImVec2 screen) -> std::pair<double, double> {
+        double mx = (screen.x - canvas_pos.x - canvas_size.x / 2.0f) / scale +
+                    map_center_x - g_map_overview.pan_x;
+        double my = -(screen.y - canvas_pos.y - canvas_size.y / 2.0f) / scale +
+                    map_center_y - g_map_overview.pan_y;
+        return {mx, my};
+    };
+
+    // Draw background
+    draw->AddRectFilled(canvas_pos,
+                        ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
+                        IM_COL32(20, 25, 35, 255));
+    draw->AddRect(canvas_pos,
+                  ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
+                  IM_COL32(60, 70, 80, 255));
+
+    // Draw map points (skip some for performance at low zoom)
+    int point_skip = std::max(1, (int)(1.0 / g_map_overview.zoom));
+    for (size_t i = 0; i < g_map_overview.map_points_2d.size(); i += point_skip) {
+        const auto& pt = g_map_overview.map_points_2d[i];
+        ImVec2 screen = mapToScreen(pt.x, pt.y);
+
+        // Frustum culling
+        if (screen.x < canvas_pos.x - 2 || screen.x > canvas_pos.x + canvas_size.x + 2 ||
+            screen.y < canvas_pos.y - 2 || screen.y > canvas_pos.y + canvas_size.y + 2)
+            continue;
+
+        float point_size = std::max(1.0f, 1.5f * (float)g_map_overview.zoom);
+        draw->AddCircleFilled(screen, point_size,
+                              IM_COL32(pt.color, pt.color, pt.color, 200));
+    }
+
+    // Draw hint marker if set
+    if (g_loc_hint.valid) {
+        ImVec2 center = mapToScreen(g_loc_hint.x, g_loc_hint.y);
+        float radius_px = (float)(g_loc_hint.search_radius_m * scale);
+
+        // Search radius circle (green, semi-transparent fill)
+        draw->AddCircleFilled(center, radius_px, IM_COL32(0, 200, 0, 40));
+        draw->AddCircle(center, radius_px, IM_COL32(0, 255, 0, 200), 48, 2.0f);
+
+        // Center dot
+        draw->AddCircleFilled(center, 6.0f, IM_COL32(0, 255, 0, 255));
+        draw->AddCircle(center, 6.0f, IM_COL32(255, 255, 255, 255), 12, 1.5f);
+
+        // Heading arrow (if known)
+        if (g_loc_hint.heading_known) {
+            float arrow_len = std::max(35.0f, radius_px * 0.35f);
+            // Note: screen Y is inverted, so negate heading for drawing
+            ImVec2 arrow_end(
+                center.x + arrow_len * (float)cos(g_loc_hint.heading_rad),
+                center.y - arrow_len * (float)sin(g_loc_hint.heading_rad)
+            );
+
+            // Arrow line
+            draw->AddLine(center, arrow_end, IM_COL32(255, 220, 0, 255), 3.0f);
+
+            // Arrow head
+            float head_angle = 0.4f;
+            float head_len = 12.0f;
+            float hr = -(float)g_loc_hint.heading_rad;  // Screen coords
+            ImVec2 head1(
+                arrow_end.x - head_len * cos(hr - head_angle),
+                arrow_end.y - head_len * sin(hr - head_angle)
+            );
+            ImVec2 head2(
+                arrow_end.x - head_len * cos(hr + head_angle),
+                arrow_end.y - head_len * sin(hr + head_angle)
+            );
+            draw->AddTriangleFilled(arrow_end, head1, head2, IM_COL32(255, 220, 0, 255));
+        }
+    }
+
+    // Draw robot position (when localized) - CYAN marker with heading arrow
+    // Only show during LOCALIZED - during RELOCALIZING the pose is in local SLAM frame
+    // and has no meaningful position on the map
+    AppState app_state = g_shared.getAppState();
+    if (app_state == AppState::LOCALIZED) {
+        Pose3D pose = g_shared.getFusedPose();
+
+        // Debug: log what the render reads (to same file, different prefix)
+        static int render_debug_counter = 0;
+        if (++render_debug_counter % 120 == 0 && g_arrow_debug_log.is_open()) {
+            g_arrow_debug_log << "RENDER," << render_debug_counter << ",,"
+                              << pose.x << "," << pose.y << ","
+                              << (pose.yaw * 180.0f / 3.14159f) << std::endl;
+            g_arrow_debug_log.flush();
+        }
+
+        ImVec2 robot_center = mapToScreen(pose.x, pose.y);
+
+        // Check if robot is within visible canvas
+        if (robot_center.x >= canvas_pos.x - 20 && robot_center.x <= canvas_pos.x + canvas_size.x + 20 &&
+            robot_center.y >= canvas_pos.y - 20 && robot_center.y <= canvas_pos.y + canvas_size.y + 20) {
+
+            // Robot body (cyan filled circle with white outline)
+            float robot_size = 8.0f;
+            draw->AddCircleFilled(robot_center, robot_size, IM_COL32(0, 220, 255, 255));
+            draw->AddCircle(robot_center, robot_size, IM_COL32(255, 255, 255, 255), 12, 2.0f);
+
+            // Heading arrow (cyan, pointing in robot's direction)
+            float arrow_len = 25.0f;
+            // Note: screen Y is inverted, so negate yaw for drawing
+            ImVec2 arrow_end(
+                robot_center.x + arrow_len * (float)cos(pose.yaw),
+                robot_center.y - arrow_len * (float)sin(pose.yaw)
+            );
+
+            // Arrow line
+            draw->AddLine(robot_center, arrow_end, IM_COL32(0, 255, 255, 255), 3.0f);
+
+            // Arrow head
+            float head_angle = 0.4f;
+            float head_len = 10.0f;
+            float hr = -pose.yaw;  // Screen coords
+            ImVec2 head1(
+                arrow_end.x - head_len * cos(hr - head_angle),
+                arrow_end.y - head_len * sin(hr - head_angle)
+            );
+            ImVec2 head2(
+                arrow_end.x - head_len * cos(hr + head_angle),
+                arrow_end.y - head_len * sin(hr + head_angle)
+            );
+            draw->AddTriangleFilled(arrow_end, head1, head2, IM_COL32(0, 255, 255, 255));
+        }
+    }
+
+    // Draw scale bar
+    float scale_bar_m = 5.0f;  // 5 meter scale bar
+    float scale_bar_px = (float)(scale_bar_m * scale);
+    while (scale_bar_px > 150) { scale_bar_m /= 2; scale_bar_px = (float)(scale_bar_m * scale); }
+    while (scale_bar_px < 30) { scale_bar_m *= 2; scale_bar_px = (float)(scale_bar_m * scale); }
+
+    if (scale_bar_px >= 20 && scale_bar_px <= 200) {
+        ImVec2 bar_start(canvas_pos.x + 15, canvas_pos.y + canvas_size.y - 15);
+        ImVec2 bar_end(bar_start.x + scale_bar_px, bar_start.y);
+        draw->AddLine(bar_start, bar_end, IM_COL32(255, 255, 255, 200), 2.0f);
+        draw->AddLine(ImVec2(bar_start.x, bar_start.y - 5),
+                      ImVec2(bar_start.x, bar_start.y + 5), IM_COL32(255, 255, 255, 200), 2.0f);
+        draw->AddLine(ImVec2(bar_end.x, bar_end.y - 5),
+                      ImVec2(bar_end.x, bar_end.y + 5), IM_COL32(255, 255, 255, 200), 2.0f);
+
+        char label[32];
+        snprintf(label, sizeof(label), "%.0fm", scale_bar_m);
+        draw->AddText(ImVec2(bar_start.x + scale_bar_px / 2 - 10, bar_start.y - 18),
+                      IM_COL32(255, 255, 255, 200), label);
+    }
+
+    // Handle mouse input
+    ImGui::InvisibleButton("map_overview_canvas", canvas_size);
+    bool is_hovered = ImGui::IsItemHovered();
+
+    if (is_hovered) {
+        ImVec2 mouse = ImGui::GetMousePos();
+
+        // Zoom with scroll wheel
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0) {
+            double old_zoom = g_map_overview.zoom;
+            g_map_overview.zoom *= (wheel > 0) ? 1.15 : (1.0 / 1.15);
+            g_map_overview.zoom = std::clamp(g_map_overview.zoom, 0.1, 20.0);
+        }
+
+        // Pan with middle mouse button
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            ImVec2 delta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Middle);
+            g_map_overview.pan_x += delta.x / scale;
+            g_map_overview.pan_y -= delta.y / scale;  // Inverted Y
+            ImGui::ResetMouseDragDelta(ImGuiMouseButton_Middle);
+        }
+
+        // Set hint with left click
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            auto [mx, my] = screenToMap(mouse);
+            g_loc_hint.valid = true;
+            g_loc_hint.x = mx;
+            g_loc_hint.y = my;
+            g_loc_hint.heading_known = false;
+            g_map_overview.is_dragging = true;
+            g_map_overview.drag_start_x = mx;
+            g_map_overview.drag_start_y = my;
+        }
+
+        // Set heading by dragging
+        if (g_map_overview.is_dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            auto [mx, my] = screenToMap(mouse);
+            double dx = mx - g_loc_hint.x;
+            double dy = my - g_loc_hint.y;
+            double dist = sqrt(dx * dx + dy * dy);
+
+            if (dist > 0.5) {  // Minimum 0.5m drag to set heading
+                g_loc_hint.heading_known = true;
+                g_loc_hint.heading_rad = atan2(dy, dx);
+            }
+        }
+
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            g_map_overview.is_dragging = false;
+        }
+
+        // Clear hint with right click
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            g_loc_hint.valid = false;
+        }
+    }
+
+    return g_loc_hint.valid;
+}
 
 // Performance metrics
 struct PerformanceMetrics {
@@ -670,6 +1058,41 @@ void OnPointCloud(const slam::LivoxPointCloudFrame& frame) {
         cloud.timestamp_ns = g_scan_start_time;
         cloud.points = std::move(g_accumulated_points);
 
+        // Localization session recording (point cloud batch)
+        if (g_loc_recording_file.is_open()) {
+            std::lock_guard<std::mutex> rec_lock(g_loc_recording_mutex);
+            if (g_loc_recording_file.is_open()) {
+                uint64_t ts = slam::recording::elapsedUs(g_loc_recording_start);
+                uint32_t npts = static_cast<uint32_t>(cloud.points.size());
+                uint32_t payload_size = sizeof(slam::recording::PointCloudBatchHeader)
+                    + npts * sizeof(slam::recording::LidarPointRecord);
+
+                slam::recording::RecordHeader hdr;
+                hdr.timestamp_us = ts;
+                hdr.type = slam::recording::RecordType::POINT_CLOUD_BATCH;
+                hdr.size = payload_size;
+                g_loc_recording_file.write(
+                    reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+
+                slam::recording::PointCloudBatchHeader batch;
+                batch.scan_timestamp_ns = cloud.timestamp_ns;
+                batch.num_points = npts;
+                g_loc_recording_file.write(
+                    reinterpret_cast<const char*>(&batch), sizeof(batch));
+
+                for (const auto& pt : cloud.points) {
+                    slam::recording::LidarPointRecord lpr;
+                    lpr.x = pt.x; lpr.y = pt.y; lpr.z = pt.z;
+                    lpr.intensity = pt.intensity;
+                    lpr.time_offset_ms = pt.time_offset_ms;
+                    lpr.tag = pt.tag;
+                    lpr.line = pt.line;
+                    g_loc_recording_file.write(
+                        reinterpret_cast<const char*>(&lpr), sizeof(lpr));
+                }
+            }
+        }
+
         // Queue for SLAM processing
         {
             std::lock_guard<std::mutex> scans_lock(g_completed_scans_mutex);
@@ -723,6 +1146,23 @@ void OnIMU(const slam::LivoxIMUFrame& frame) {
         }
     }
 
+    // Localization session recording (IMU)
+    if (g_loc_recording_file.is_open()) {
+        std::lock_guard<std::mutex> rec_lock(g_loc_recording_mutex);
+        if (g_loc_recording_file.is_open()) {
+            slam::recording::ImuRecord rec;
+            rec.acc_x = static_cast<float>(imu.acc.x());
+            rec.acc_y = static_cast<float>(imu.acc.y());
+            rec.acc_z = static_cast<float>(imu.acc.z());
+            rec.gyro_x = static_cast<float>(imu.gyro.x());
+            rec.gyro_y = static_cast<float>(imu.gyro.y());
+            rec.gyro_z = static_cast<float>(imu.gyro.z());
+            slam::recording::writeRecord(g_loc_recording_file,
+                slam::recording::elapsedUs(g_loc_recording_start),
+                slam::recording::RecordType::IMU, rec);
+        }
+    }
+
     // Keep buffer bounded
     // PERFORMANCE FIX: Use pop_front (O(1) for deque) instead of erase (O(n) for vector)
     while (g_imu_queue.size() > 100) {
@@ -768,6 +1208,42 @@ void UpdateSlamState() {
     gui_slam_pose.pitch = slam_pose.pitch;
     gui_slam_pose.yaw = slam_pose.yaw;
     g_shared.setSlamPose(gui_slam_pose);
+
+    // Also update fused pose so the 2D map arrow tracks in real time
+    // (VESC fusion loop also updates this, but SLAM pose is the primary source)
+    g_shared.setFusedPose(gui_slam_pose);
+
+    // Debug: file-based logging - ALWAYS log (not just during LOCALIZED)
+    {
+        if (!g_arrow_debug_log.is_open()) {
+            g_arrow_debug_log.open("arrow_debug.csv");
+            g_arrow_debug_log << "source,counter,state,getPose_x,getPose_y,getPose_yaw_deg,"
+                              << "localization_mode,transform_init,"
+                              << "local_x,local_y,local_yaw_deg,"
+                              << "fused_read_x,fused_read_y,fused_read_yaw_deg" << std::endl;
+        }
+        g_arrow_debug_counter++;
+        if (g_arrow_debug_counter % 50 == 0) {  // Log every 50th call
+            AppState dbg_state = g_shared.getAppState();
+            Pose3D readback = g_shared.getFusedPose();
+            Eigen::Matrix4d T_local = g_slam->getLocalPose();
+            Eigen::Vector3d local_pos = T_local.block<3,1>(0,3);
+            double local_yaw = std::atan2(T_local(1,0), T_local(0,0));
+
+            g_arrow_debug_log << "UPDATE," << g_arrow_debug_counter << ","
+                              << static_cast<int>(dbg_state) << ","
+                              << gui_slam_pose.x << "," << gui_slam_pose.y << ","
+                              << (gui_slam_pose.yaw * 180.0f / 3.14159f) << ","
+                              << g_slam->isLocalizationMode() << ","
+                              << g_slam->isTransformInitialized() << ","
+                              << local_pos.x() << "," << local_pos.y() << ","
+                              << (local_yaw * 180.0 / M_PI) << ","
+                              << readback.x << "," << readback.y << ","
+                              << (readback.yaw * 180.0f / 3.14159f)
+                              << std::endl;
+            g_arrow_debug_log.flush();
+        }
+    }
 
     // Log SLAM pose for diagnostics
     if (g_diag_logger.isRunning()) {
@@ -886,24 +1362,33 @@ void UpdateMapPointsForVisualization() {
 
     g_shared.setCurrentScan(scan_render);
 
-    // During localization, update the localization viewer overlay with the local map
-    // This shows the local map being built (in green) over the pre-built map (in turbo colormap)
+    // During localization (RELOCALIZING only), optionally update the localization viewer overlay
+    // This shows the local map being built (in magenta) over the pre-built map (in turbo colormap)
+    // Once LOCALIZED, we clear the overlay since we're now tracking on the pre-built map
+    // User can toggle this off via g_hide_local_map_overlay
     AppState state = g_shared.getAppState();
-    if (g_viewers_initialized && g_localization_viewer &&
-        (state == AppState::RELOCALIZING || state == AppState::LOCALIZED)) {
-        std::vector<slam::viz::PointData> overlay_points;
-        overlay_points.reserve(world_points.size());
-        for (const auto& wp : world_points) {
-            slam::viz::PointData pd;
-            pd.x = wp.x;
-            pd.y = wp.y;
-            pd.z = wp.z;
-            pd.intensity = static_cast<uint8_t>(std::clamp(wp.intensity, 0.0f, 255.0f));
-            pd.padding[0] = pd.padding[1] = pd.padding[2] = 0;
-            overlay_points.push_back(pd);
+    if (g_viewers_initialized && g_localization_viewer) {
+        if (state == AppState::RELOCALIZING && !g_hide_local_map_overlay) {
+            // Show local map as bright magenta overlay during localization
+            std::vector<slam::viz::PointData> overlay_points;
+            overlay_points.reserve(world_points.size());
+            for (const auto& wp : world_points) {
+                slam::viz::PointData pd;
+                pd.x = wp.x;
+                pd.y = wp.y;
+                pd.z = wp.z;
+                pd.intensity = static_cast<uint8_t>(std::clamp(wp.intensity, 0.0f, 255.0f));
+                pd.padding[0] = pd.padding[1] = pd.padding[2] = 0;
+                overlay_points.push_back(pd);
+            }
+            g_localization_viewer->updateOverlayPointCloud(overlay_points.data(), overlay_points.size());
+            // Use bright magenta/pink for local map - very distinct from turbo colormap!
+            g_localization_viewer->setOverlayColorTint(1.0f, 0.3f, 0.8f);  // Magenta
+        } else {
+            // Clear overlay when not actively localizing (LOCALIZED, MAPPING, etc.)
+            // or when user has hidden it
+            g_localization_viewer->clearOverlayPointCloud();
         }
-        g_localization_viewer->updateOverlayPointCloud(overlay_points.data(), overlay_points.size());
-        g_localization_viewer->setOverlayColorTint(0.2f, 1.0f, 0.4f);  // Bright green for local map
     }
 }
 
@@ -1433,12 +1918,28 @@ void WorkerThread() {
     // Control is handled by the dedicated high-priority ControlThread
 
     while (g_running.load()) {
+      try {
         auto now = std::chrono::steady_clock::now();
         float dt = std::chrono::duration<float>(now - last_update).count();
         last_update = now;
 
         // Clamp dt to reasonable range (prevents issues after long stalls)
         dt = std::clamp(dt, 0.001f, 0.1f);
+
+        // Debug: log loop-alive during LOCALIZED (every iteration)
+        {
+            AppState loop_top_state = g_shared.getAppState();
+            if (loop_top_state == AppState::LOCALIZED && g_loop_debug_log.is_open()) {
+                static int localized_iter = 0;
+                localized_iter++;
+                if (localized_iter % 10 == 0) {  // Every 10th iteration during LOCALIZED
+                    g_loop_debug_log << "LOOP_TOP," << localized_iter
+                                     << ",state=" << static_cast<int>(loop_top_state)
+                                     << ",dt=" << dt << std::endl;
+                    g_loop_debug_log.flush();
+                }
+            }
+        }
 
         // 1. Check E-STOP first
         if (g_e_stop.load()) {
@@ -1642,12 +2143,13 @@ void WorkerThread() {
                             // Use loadPrebuiltMap() - stores in memory, doesn't replace ikd-tree
                             // This allows FAST-LIO to build a local map for progressive localization
                             if (g_slam->loadPrebuiltMap(file_cmd->path)) {
+                                g_loaded_map_path = file_cmd->path;  // Track for recording
                                 g_shared.setAppState(AppState::MAP_LOADED);
                                 g_shared.setStatusMessage("Map loaded: " + file_cmd->path + " - Click Relocalize to start");
 
                                 // Update localization viewer with pre-built map
+                                auto prebuilt = g_slam->getPrebuiltMapPoints();
                                 if (g_viewers_initialized && g_localization_viewer) {
-                                    auto prebuilt = g_slam->getPrebuiltMapPoints();
                                     std::vector<slam::viz::PointData> gpu_points;
                                     gpu_points.reserve(prebuilt.size());
                                     for (const auto& wp : prebuilt) {
@@ -1662,6 +2164,9 @@ void WorkerThread() {
                                     g_localization_viewer->updatePointCloud(gpu_points.data(), gpu_points.size());
                                     g_localization_viewer->fitCameraToContent();
                                 }
+
+                                // Build 2D map overview cache for hint selection widget
+                                buildMapOverviewCache(prebuilt);
 
                                 // Reset relocalization progress
                                 RelocalizationProgress prog;
@@ -1705,6 +2210,26 @@ void WorkerThread() {
                         loc_config.max_attempts = 5;
                         loc_config.min_confidence = 0.45;
                         loc_config.high_confidence = 0.65;
+
+                        // Pass hint parameters if set (from MapOverviewWidget)
+                        if (g_loc_hint.valid) {
+                            loc_config.use_hint = true;
+                            loc_config.hint_x = g_loc_hint.x;
+                            loc_config.hint_y = g_loc_hint.y;
+                            loc_config.hint_radius = g_loc_hint.search_radius_m;
+                            loc_config.hint_heading = g_loc_hint.heading_rad;
+                            loc_config.hint_heading_known = g_loc_hint.heading_known;
+                            loc_config.hint_heading_range = g_loc_hint.heading_range_rad;
+                            // Use finer grid when hint is provided
+                            loc_config.grid_step = 1.0;
+                            loc_config.yaw_step_deg = 15.0;
+                            std::cout << "[Relocalize] Using hint: (" << g_loc_hint.x
+                                      << ", " << g_loc_hint.y << ") radius=" << g_loc_hint.search_radius_m
+                                      << "m" << (g_loc_hint.heading_known ? " heading=" + std::to_string(g_loc_hint.heading_rad * 180.0 / M_PI) + "deg" : "")
+                                      << std::endl;
+                        } else {
+                            std::cout << "[Relocalize] No hint - searching entire map (slower)" << std::endl;
+                        }
 
                         // Start progressive localization (FAST-LIO continues building local map)
                         g_slam->startProgressiveLocalization(loc_config);
@@ -1784,6 +2309,49 @@ void WorkerThread() {
                             prog.success = true;
                             prog.confidence = static_cast<float>(result.confidence);
                             prog.status_text = "Localized! (" + std::to_string(int(result.confidence * 100)) + "% confidence)";
+
+                            // Update GUI with discovered global pose and reset fusion
+                            {
+                                Eigen::Vector3d pos = result.pose.block<3, 1>(0, 3);
+                                Eigen::Matrix3d rot = result.pose.block<3, 3>(0, 0);
+                                float yaw = static_cast<float>(std::atan2(rot(1, 0), rot(0, 0)));
+                                float pitch = static_cast<float>(-std::asin(std::clamp(rot(2, 0), -1.0, 1.0)));
+                                float roll = static_cast<float>(std::atan2(rot(2, 1), rot(2, 2)));
+
+                                Pose3D discovered_pose;
+                                discovered_pose.x = static_cast<float>(pos.x());
+                                discovered_pose.y = static_cast<float>(pos.y());
+                                discovered_pose.z = static_cast<float>(pos.z());
+                                discovered_pose.roll = roll;
+                                discovered_pose.pitch = pitch;
+                                discovered_pose.yaw = yaw;
+                                g_shared.setFusedPose(discovered_pose);
+                                g_shared.setSlamPose(discovered_pose);
+
+                                if (g_fusion) {
+                                    slam::Pose3D slam_pose;
+                                    slam_pose.x = discovered_pose.x;
+                                    slam_pose.y = discovered_pose.y;
+                                    slam_pose.z = discovered_pose.z;
+                                    slam_pose.roll = discovered_pose.roll;
+                                    slam_pose.pitch = discovered_pose.pitch;
+                                    slam_pose.yaw = discovered_pose.yaw;
+                                    g_fusion->reset(slam_pose);
+                                }
+
+                                std::cout << "  GUI updated with discovered pose: ("
+                                          << discovered_pose.x << ", " << discovered_pose.y
+                                          << ") yaw=" << (discovered_pose.yaw * 180.0f / 3.14159f) << "deg" << std::endl;
+                            }
+
+                            // Clear overlay and center viewer
+                            if (g_viewers_initialized && g_localization_viewer) {
+                                Pose3D pose = g_shared.getFusedPose();
+                                g_localization_viewer->setRobotPose(pose.x, pose.y, pose.yaw);
+                                g_localization_viewer->centerCameraOnRobot();
+                                g_localization_viewer->clearOverlayPointCloud();
+                            }
+
                             g_shared.setAppState(AppState::LOCALIZED);
                             g_shared.setStatusMessage("Localization successful!");
                         } else if (result.status == slam::LocalizationStatus::FAILED) {
@@ -2009,15 +2577,26 @@ void WorkerThread() {
 
                 case CommandType::SET_POSE_HINT: {
                     auto* hint_cmd = std::get_if<PoseHintCommand>(&cmd->payload);
-                    if (hint_cmd && g_slam) {
-                        // Convert hint to 4x4 transform and set as initial guess
-                        float theta = hint_cmd->theta_deg * 3.14159f / 180.0f;
-                        Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-                        T(0,0) = std::cos(theta); T(0,1) = -std::sin(theta);
-                        T(1,0) = std::sin(theta); T(1,1) = std::cos(theta);
-                        T(0,3) = hint_cmd->x;
-                        T(1,3) = hint_cmd->y;
-                        g_slam->setInitialPose(T);
+                    if (hint_cmd) {
+                        // Store hint for use by RELOCALIZE command
+                        g_loc_hint.valid = true;
+                        g_loc_hint.x = hint_cmd->x;
+                        g_loc_hint.y = hint_cmd->y;
+                        g_loc_hint.heading_rad = hint_cmd->theta_deg * M_PI / 180.0;
+                        g_loc_hint.heading_known = hint_cmd->heading_known;
+                        g_loc_hint.search_radius_m = hint_cmd->search_radius_m;
+
+                        // Also set as initial pose for SLAM engine (legacy support)
+                        if (g_slam) {
+                            float theta = hint_cmd->theta_deg * 3.14159f / 180.0f;
+                            Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+                            T(0,0) = std::cos(theta); T(0,1) = -std::sin(theta);
+                            T(1,0) = std::sin(theta); T(1,1) = std::cos(theta);
+                            T(0,3) = hint_cmd->x;
+                            T(1,3) = hint_cmd->y;
+                            // PRESERVE BIASES - IMU has been running
+                            g_slam->setInitialPose(T, true);
+                        }
                     }
                     break;
                 }
@@ -2025,18 +2604,60 @@ void WorkerThread() {
                 case CommandType::START_RECORDING: {
                     auto* file_cmd = std::get_if<FileCommand>(&cmd->payload);
                     if (file_cmd) {
-                        // TODO: Implement recording to file
-                        g_shared.setRecordingStatus(true, file_cmd->path);
-                        g_shared.setStatusMessage("Recording started: " + file_cmd->path);
+                        std::lock_guard<std::mutex> lock(g_loc_recording_mutex);
+                        g_loc_recording_file.open(file_cmd->path, std::ios::binary);
+                        if (g_loc_recording_file.is_open()) {
+                            // Write file header
+                            slam::recording::writeFileHeader(g_loc_recording_file);
+
+                            // Write session header
+                            slam::recording::SessionHeader session = {};
+                            session.map_filename_len = static_cast<uint16_t>(g_loaded_map_path.size());
+                            session.hint_valid = g_loc_hint.valid ? 1 : 0;
+                            session.hint_x = static_cast<float>(g_loc_hint.x);
+                            session.hint_y = static_cast<float>(g_loc_hint.y);
+                            session.hint_heading_rad = static_cast<float>(g_loc_hint.heading_rad);
+                            session.hint_search_radius_m = static_cast<float>(g_loc_hint.search_radius_m);
+                            session.hint_heading_known = g_loc_hint.heading_known ? 1 : 0;
+                            session.voxel_size = g_config.voxel_size;
+                            session.gyr_cov = g_config.gyr_cov;
+                            session.acc_cov = g_config.gyr_cov;  // Same as gyr for this robot
+                            session.imu_lpf_alpha = g_config.imu_lpf_alpha;
+                            session.blind_distance = g_config.blind_distance;
+                            session.point_filter = static_cast<uint8_t>(g_config.point_filter);
+                            session.deskew_enabled = g_config.deskew_enabled ? 1 : 0;
+                            session.max_iterations = g_config.max_iterations;
+                            session.max_points_icp = g_config.max_points_icp;
+                            session.max_position_jump = g_config.max_position_jump;
+                            session.max_rotation_jump_deg = g_config.max_rotation_jump;
+
+                            g_loc_recording_file.write(
+                                reinterpret_cast<const char*>(&session), sizeof(session));
+                            g_loc_recording_file.write(
+                                g_loaded_map_path.data(), session.map_filename_len);
+
+                            g_loc_recording_start = std::chrono::steady_clock::now();
+                            g_shared.setRecordingStatus(true, file_cmd->path);
+                            g_shared.setStatusMessage("Recording started: " + file_cmd->path);
+                            std::cout << "[Recording] Started: " << file_cmd->path
+                                      << " (map: " << g_loaded_map_path << ")" << std::endl;
+                        } else {
+                            g_shared.setStatusMessage("Failed to open recording file!");
+                        }
                     }
                     break;
                 }
 
-                case CommandType::STOP_RECORDING:
-                    // TODO: Stop actual recording
+                case CommandType::STOP_RECORDING: {
+                    std::lock_guard<std::mutex> lock(g_loc_recording_mutex);
+                    if (g_loc_recording_file.is_open()) {
+                        g_loc_recording_file.close();
+                        std::cout << "[Recording] Stopped" << std::endl;
+                    }
                     g_shared.setRecordingStatus(false);
                     g_shared.setStatusMessage("Recording stopped");
                     break;
+                }
 
                 case CommandType::LOAD_HULL_MESH: {
                     auto* file_cmd = std::get_if<FileCommand>(&cmd->payload);
@@ -2093,6 +2714,15 @@ void WorkerThread() {
         bool do_slam = (state == AppState::MAPPING || state == AppState::LOCALIZED ||
                         state == AppState::RELOCALIZING);
 
+        // Debug: main loop flow logging
+        {
+            if (!g_loop_debug_log.is_open()) {
+                g_loop_debug_log.open("loop_debug.csv");
+                g_loop_debug_log << "iter,state,do_slam,g_slam,g_slam_init,processed,update_called,vesc_guard_pass" << std::endl;
+            }
+            g_loop_debug_counter++;
+        }
+
         if (do_slam && g_slam) {
             // Process IMU data
             {
@@ -2115,8 +2745,28 @@ void WorkerThread() {
             }
 
             // Run SLAM processing with timing
+            // Debug: log every process() call during LOCALIZED to detect blocking
+            if (state == AppState::LOCALIZED && g_loop_debug_log.is_open()) {
+                g_loop_debug_log << "PRE_PROCESS," << g_loop_debug_counter << std::endl;
+                g_loop_debug_log.flush();
+            }
             auto slam_start = std::chrono::steady_clock::now();
-            int processed = g_slam->process();
+            int processed = -999;
+            try {
+                processed = g_slam->process();
+            } catch (const std::exception& e) {
+                if (g_loop_debug_log.is_open()) {
+                    g_loop_debug_log << "EXCEPTION in process(): " << e.what() << std::endl;
+                    g_loop_debug_log.flush();
+                }
+                processed = -1;
+            } catch (...) {
+                if (g_loop_debug_log.is_open()) {
+                    g_loop_debug_log << "UNKNOWN EXCEPTION in process()" << std::endl;
+                    g_loop_debug_log.flush();
+                }
+                processed = -1;
+            }
             auto slam_end = std::chrono::steady_clock::now();
 
             if (processed > 0) {
@@ -2167,6 +2817,22 @@ void WorkerThread() {
 
             // Update SLAM state to GUI
             UpdateSlamState();
+
+            // Debug: log that we reached UpdateSlamState
+            if (g_loop_debug_log.is_open() && g_loop_debug_counter % 50 == 0) {
+                float proc_ms = std::chrono::duration<float, std::milli>(slam_end - slam_start).count();
+                g_loop_debug_log << g_loop_debug_counter << ","
+                                 << static_cast<int>(state) << ","
+                                 << do_slam << ","
+                                 << (g_slam != nullptr) << ","
+                                 << (g_slam ? g_slam->isInitialized() : false) << ","
+                                 << processed << ","
+                                 << "1,"  // update_called = true
+                                 << "0"   // vesc_guard_pass TBD
+                                 << ",proc_ms=" << proc_ms
+                                 << std::endl;
+                g_loop_debug_log.flush();
+            }
 
             // Update map points for 3D visualization (throttled internally)
             UpdateMapPointsForVisualization();
@@ -2250,7 +2916,64 @@ void WorkerThread() {
                         // Swap to pre-built map for continued tracking
                         g_slam->swapToPrebuiltMap(loc_result.transform);
 
+                        // IMMEDIATELY update GUI with discovered global pose
+                        // Use loc_result.pose (global robot pose), NOT loc_result.transform (odom→map)
+                        {
+                            Eigen::Vector3d pos = loc_result.pose.block<3, 1>(0, 3);
+                            Eigen::Matrix3d rot = loc_result.pose.block<3, 3>(0, 0);
+                            float yaw = static_cast<float>(std::atan2(rot(1, 0), rot(0, 0)));
+                            float pitch = static_cast<float>(-std::asin(std::clamp(rot(2, 0), -1.0, 1.0)));
+                            float roll = static_cast<float>(std::atan2(rot(2, 1), rot(2, 2)));
+
+                            // Update shared state immediately
+                            Pose3D discovered_pose;
+                            discovered_pose.x = static_cast<float>(pos.x());
+                            discovered_pose.y = static_cast<float>(pos.y());
+                            discovered_pose.z = static_cast<float>(pos.z());
+                            discovered_pose.roll = roll;
+                            discovered_pose.pitch = pitch;
+                            discovered_pose.yaw = yaw;
+                            g_shared.setFusedPose(discovered_pose);
+                            g_shared.setSlamPose(discovered_pose);
+
+                            // RESET sensor fusion to discovered pose
+                            // This is critical - fusion maintains its own state that must match
+                            // the global pose discovered by localization
+                            if (g_fusion) {
+                                slam::Pose3D slam_pose;
+                                slam_pose.x = discovered_pose.x;
+                                slam_pose.y = discovered_pose.y;
+                                slam_pose.z = discovered_pose.z;
+                                slam_pose.roll = discovered_pose.roll;
+                                slam_pose.pitch = discovered_pose.pitch;
+                                slam_pose.yaw = discovered_pose.yaw;
+                                // Reset (not just update) - forces fusion state to match discovered pose
+                                g_fusion->reset(slam_pose);
+                            }
+
+                            std::cout << "  GUI updated with discovered pose: ("
+                                      << discovered_pose.x << ", " << discovered_pose.y
+                                      << ") yaw=" << (discovered_pose.yaw * 180.0f / 3.14159f) << "deg" << std::endl;
+                        }
+
+                        // Update robot pose in localization viewer and clear the local map overlay
+                        if (g_viewers_initialized && g_localization_viewer) {
+                            Pose3D pose = g_shared.getFusedPose();
+                            g_localization_viewer->setRobotPose(pose.x, pose.y, pose.yaw);
+                            g_localization_viewer->centerCameraOnRobot();
+                            // Clear the local map overlay immediately - we're now tracking on pre-built map
+                            g_localization_viewer->clearOverlayPointCloud();
+                        }
+
+                        // Set app state BEFORE updating trajectory/poses so UI sees LOCALIZED state
                         g_shared.setAppState(AppState::LOCALIZED);
+
+                        // Add discovered position to trajectory
+                        {
+                            Pose3D traj_pose = g_shared.getFusedPose();
+                            g_shared.addTrajectoryPoint(traj_pose);
+                        }
+
                         g_shared.setStatusMessage("Localization successful - tracking on pre-built map");
                         break;
 
@@ -2271,6 +2994,21 @@ void WorkerThread() {
                 }
 
                 g_shared.setRelocalizationProgress(prog);
+            }
+        } else {
+            // do_slam is false OR g_slam is null - log this!
+            if (g_loop_debug_log.is_open() && g_loop_debug_counter % 50 == 0) {
+                g_loop_debug_log << g_loop_debug_counter << ","
+                                 << static_cast<int>(state) << ","
+                                 << do_slam << ","
+                                 << (g_slam != nullptr) << ","
+                                 << (g_slam ? g_slam->isInitialized() : false) << ","
+                                 << "-1,"   // processed = N/A
+                                 << "0,"    // update_called = false (SKIPPED!)
+                                 << "0"     // vesc_guard_pass TBD
+                                 << ",SKIPPED_SLAM"
+                                 << std::endl;
+                g_loop_debug_log.flush();
             }
         }
 
@@ -2301,6 +3039,25 @@ void WorkerThread() {
                 actual_angular = g_target_angular.load();  // Fallback to command
             }
 
+            // Localization session recording (VESC odometry)
+            if (g_loc_recording_file.is_open()) {
+                std::lock_guard<std::mutex> rec_lock(g_loc_recording_mutex);
+                if (g_loc_recording_file.is_open()) {
+                    slam::recording::VescOdomRecord rec;
+                    rec.velocity_left_mps = odom.velocity_left_mps;
+                    rec.velocity_right_mps = odom.velocity_right_mps;
+                    rec.erpm_left = status_l.erpm;
+                    rec.erpm_right = status_r.erpm;
+                    rec.tach_left = status_l.tachometer;
+                    rec.tach_right = status_r.tachometer;
+                    rec.linear_vel = linear_vel;
+                    rec.angular_vel = actual_angular;
+                    slam::recording::writeRecord(g_loc_recording_file,
+                        slam::recording::elapsedUs(g_loc_recording_start),
+                        slam::recording::RecordType::VESC_ODOM, rec);
+                }
+            }
+
             // Update sensor fusion with actual measured velocities
             g_fusion->updateWheelOdometry(
                 linear_vel,
@@ -2316,6 +3073,9 @@ void WorkerThread() {
             slam::MotionState motion = g_fusion->getMotionState();
 
             // Update shared state
+            // During LOCALIZED state, UpdateSlamState() already sets fused pose
+            // directly from getPose() (transform fusion). Don't overwrite with the
+            // slowly-converging fusion output, which causes the arrow to appear frozen.
             Pose3D gui_fused;
             gui_fused.x = fused.x;
             gui_fused.y = fused.y;
@@ -2323,7 +3083,23 @@ void WorkerThread() {
             gui_fused.roll = fused.roll;
             gui_fused.pitch = fused.pitch;
             gui_fused.yaw = fused.yaw;
-            g_shared.setFusedPose(gui_fused);
+            {
+                AppState vesc_state = g_shared.getAppState();
+                bool vesc_guard_pass = (vesc_state != AppState::LOCALIZED);
+                if (vesc_guard_pass) {
+                    g_shared.setFusedPose(gui_fused);
+                }
+                // Debug: log VESC guard result
+                if (g_loop_debug_log.is_open() && g_loop_debug_counter % 50 == 0) {
+                    g_loop_debug_log << "VESC," << g_loop_debug_counter << ","
+                                     << static_cast<int>(vesc_state) << ","
+                                     << vesc_guard_pass << ","
+                                     << gui_fused.x << "," << gui_fused.y << ","
+                                     << (gui_fused.yaw * 180.0f / 3.14159f)
+                                     << std::endl;
+                    g_loop_debug_log.flush();
+                }
+            }
 
             Velocity2D gui_vel;
             gui_vel.linear = fused_vel.linear_x;
@@ -2416,7 +3192,37 @@ void WorkerThread() {
             g_shared.setLidarStatus(lidar_status);
         }
 
+        // Debug: log end of loop body during LOCALIZED
+        {
+            AppState loop_end_state = g_shared.getAppState();
+            if (loop_end_state == AppState::LOCALIZED && g_loop_debug_log.is_open()) {
+                static int end_iter = 0;
+                end_iter++;
+                if (end_iter % 10 == 0) {
+                    g_loop_debug_log << "LOOP_END," << end_iter
+                                     << ",state=" << static_cast<int>(loop_end_state)
+                                     << std::endl;
+                    g_loop_debug_log.flush();
+                }
+            }
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(20));  // 50Hz loop
+      } catch (const std::exception& e) {
+        if (g_loop_debug_log.is_open()) {
+            g_loop_debug_log << "CRASH," << g_loop_debug_counter
+                             << ",exception=" << e.what() << std::endl;
+            g_loop_debug_log.flush();
+        }
+        std::cerr << "[WorkerThread] EXCEPTION: " << e.what() << std::endl;
+      } catch (...) {
+        if (g_loop_debug_log.is_open()) {
+            g_loop_debug_log << "CRASH," << g_loop_debug_counter
+                             << ",unknown_exception" << std::endl;
+            g_loop_debug_log.flush();
+        }
+        std::cerr << "[WorkerThread] UNKNOWN EXCEPTION" << std::endl;
+      }
     }
 
     // Cleanup on exit
@@ -2901,6 +3707,44 @@ void DrawStatusBar() {
         }
         ImGui::PopStyleColor(2);
         SetTooltip("Start diagnostic recording. Logs all sensor data, SLAM state, and performance metrics.");
+    }
+
+    // Record Data Streams button (next to E-STOP)
+    ImGui::SameLine(ImGui::GetWindowWidth() - 290);
+    {
+        bool is_recording = g_loc_recording_file.is_open();
+        if (is_recording) {
+            // Pulsing red recording indicator
+            float pulse = 0.5f + 0.5f * std::sin(ImGui::GetTime() * 4.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.1f, 0.1f, 0.7f + 0.3f * pulse));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
+            float elapsed = std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - g_loc_recording_start).count();
+            char label[64];
+            snprintf(label, sizeof(label), "STOP REC (%.0fs)", elapsed);
+            if (ImGui::Button(label, ImVec2(150, 28))) {
+                g_commands.push(Command::simple(CommandType::STOP_RECORDING));
+            }
+            SetTooltip("Stop recording sensor data streams.");
+            ImGui::PopStyleColor(2);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.1f, 0.4f, 0.1f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
+            if (ImGui::Button("Record Streams", ImVec2(150, 28))) {
+                // Auto-generate filename with timestamp
+                auto now = std::chrono::system_clock::now();
+                auto time = std::chrono::system_clock::to_time_t(now);
+                struct tm tm_buf;
+                localtime_s(&tm_buf, &time);
+                char filename[128];
+                snprintf(filename, sizeof(filename), "loc_session_%04d%02d%02d_%02d%02d%02d.bin",
+                    tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                    tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+                g_commands.push(Command::file(CommandType::START_RECORDING, filename));
+            }
+            SetTooltip("Record IMU, LiDAR, and VESC data streams for offline replay.");
+            ImGui::PopStyleColor(2);
+        }
     }
 
     // E-STOP button on the right
@@ -3841,71 +4685,67 @@ void DrawLocalizationTab() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Relocalization
-    ImGui::Text("Global Relocalization");
-
-    // Initial pose hint (optional)
-    static float hint_x = 0.0f, hint_y = 0.0f, hint_yaw = 0.0f;
-    static bool use_pose_hint = false;
-    static bool click_to_pose_active = false;
-
-    ImGui::Checkbox("Use pose hint", &use_pose_hint);
+    // Relocalization with hint-based search
+    ImGui::Text("Position Hint");
     ImGui::SameLine();
-    HelpMarker("Provide approximate position to help.");
-
-    if (use_pose_hint) {
-        // Visual pose hint button - click on map
-        if (g_viewers_initialized && g_localization_viewer) {
-            bool was_active = click_to_pose_active;
-            if (click_to_pose_active) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.3f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.8f, 0.4f, 1.0f));
-            }
-            if (ImGui::Button(click_to_pose_active ? "Click on Map..." : "Click on Map", ImVec2(-1, 25))) {
-                click_to_pose_active = !click_to_pose_active;
-            }
-            if (click_to_pose_active) {
-                ImGui::PopStyleColor(2);
-            }
-            SetTooltip("Click on map to set position. Drag to set heading direction.");
-
-            // Set up/remove callback when mode changes
-            if (click_to_pose_active != was_active) {
-                if (click_to_pose_active) {
-                    g_localization_viewer->setMapClickCallback([](float x, float y, float heading) {
-                        hint_x = x;
-                        hint_y = y;
-                        if (!std::isnan(heading)) {
-                            hint_yaw = heading * 180.0f / 3.14159f;  // Convert to degrees
-                        }
-                        // Don't auto-disable - user can click again to refine
-                    });
-                    g_localization_viewer->setClickToPoseMode(true);
-                } else {
-                    g_localization_viewer->setMapClickCallback(nullptr);
-                    g_localization_viewer->setClickToPoseMode(false);
-                }
-            }
-
-            if (click_to_pose_active) {
-                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Click map to set position");
-            }
-        }
-
-        ImGui::SetNextItemWidth(-1);
-        ImGui::DragFloat("##HintX", &hint_x, 0.1f, -100.0f, 100.0f, "X: %.1f m");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::DragFloat("##HintY", &hint_y, 0.1f, -100.0f, 100.0f, "Y: %.1f m");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::DragFloat("##HintYaw", &hint_yaw, 1.0f, -180.0f, 180.0f, "Yaw: %.0f deg");
-    } else if (click_to_pose_active) {
-        // Disable click-to-pose if hint was unchecked
-        click_to_pose_active = false;
-        if (g_localization_viewer) {
-            g_localization_viewer->setMapClickCallback(nullptr);
-            g_localization_viewer->setClickToPoseMode(false);
-        }
+    HelpMarker("Click on the 2D map overview to set approximate position.\n"
+               "Drag to indicate heading direction (optional).\n"
+               "Adjust search radius with slider.\n"
+               "Right-click to clear hint.");
+    ImGui::SameLine();
+    // Expand/collapse button for hint window
+    if (ImGui::SmallButton(g_hint_window_expanded ? "[-]" : "[+]")) {
+        g_hint_window_expanded = !g_hint_window_expanded;
     }
+    SetTooltip(g_hint_window_expanded ? "Collapse hint map" : "Expand hint map to full panel");
+
+    // Show 2D map overview widget for hint selection
+    if (g_map_overview.cache_valid) {
+        // Calculate available height for widget - expand to fill panel if requested
+        float avail_height = g_hint_window_expanded ?
+            std::max(300.0f, ImGui::GetContentRegionAvail().y * 0.7f) :
+            std::min(180.0f, ImGui::GetContentRegionAvail().y * 0.35f);
+        float widget_width = ImGui::GetContentRegionAvail().x;
+
+        // Render the 2D overview widget
+        renderMapOverviewWidget(widget_width, avail_height);
+
+        // Search radius slider
+        ImGui::SetNextItemWidth(-1);
+        float radius = static_cast<float>(g_loc_hint.search_radius_m);
+        if (ImGui::SliderFloat("##SearchRadius", &radius, 2.0f, 50.0f, "Search radius: %.0fm")) {
+            g_loc_hint.search_radius_m = radius;
+        }
+        SetTooltip("Search radius around the hint position.");
+
+        // Show hint status
+        if (g_loc_hint.valid) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
+                "Hint: (%.1f, %.1f)", g_loc_hint.x, g_loc_hint.y);
+            if (g_loc_hint.heading_known) {
+                float heading_deg = static_cast<float>(g_loc_hint.heading_rad * 180.0 / M_PI);
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.3f, 1.0f), "@ %.0f deg", heading_deg);
+            }
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                "Click map to set hint position");
+        }
+    } else {
+        // No map loaded yet
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+            "Load a map to set position hint");
+    }
+
+    ImGui::Spacing();
+
+    // Local map overlay visibility checkbox
+    ImGui::Checkbox("Hide local map overlay", &g_hide_local_map_overlay);
+    SetTooltip("When checked, the local map being built is not shown\n"
+               "overlaid on the prebuilt map. Uncheck to see local map\n"
+               "in magenta color for debugging alignment.");
+
+    ImGui::Spacing();
 
     // Allow relocalize from MAP_LOADED, RELOCALIZE_FAILED, OPERATING, or MAPPING (auto-switch)
     bool can_relocalize = (state == AppState::MAP_LOADED || state == AppState::RELOCALIZE_FAILED ||
@@ -3920,12 +4760,21 @@ void DrawLocalizationTab() {
         } else if (state == AppState::MAPPING) {
             g_commands.push(Command::simple(CommandType::STOP_MAPPING));
         }
-        if (use_pose_hint) {
-            g_commands.push(Command::poseHint(hint_x, hint_y, hint_yaw));
+        // Pass hint if valid - uses new LocalizationHint system
+        if (g_loc_hint.valid) {
+            float yaw_deg = g_loc_hint.heading_known ?
+                static_cast<float>(g_loc_hint.heading_rad * 180.0 / M_PI) : 0.0f;
+            g_commands.push(Command::poseHint(
+                static_cast<float>(g_loc_hint.x),
+                static_cast<float>(g_loc_hint.y),
+                yaw_deg,
+                static_cast<float>(g_loc_hint.search_radius_m),
+                g_loc_hint.heading_known
+            ));
         }
         g_commands.push(Command::simple(CommandType::RELOCALIZE));
     }
-    SetTooltip("Find robot position using global search.");
+    SetTooltip("Find robot position in hint region. Set hint by clicking on map above.");
     ImGui::PopStyleColor(2);
     ImGui::EndDisabled();
 
@@ -5090,8 +5939,57 @@ void DrawMainWindow() {
 // Main Entry Point
 //==============================================================================
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    // Allocate console for debug output
+    AllocConsole();
+    freopen("CONOUT$", "w", stdout);
+    freopen("CONOUT$", "w", stderr);
+    std::cout << "=== SLAM GUI Debug Console ===" << std::endl;
+
     // Log application startup
     LOG_INFO("System", "SLAM Control GUI starting...");
+
+    // Check for existing slam_gui instances
+    {
+        DWORD current_pid = GetCurrentProcessId();
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32 pe;
+            pe.dwSize = sizeof(pe);
+            std::vector<DWORD> other_pids;
+            if (Process32First(snap, &pe)) {
+                do {
+                    if (_stricmp(pe.szExeFile, "slam_gui.exe") == 0 &&
+                        pe.th32ProcessID != current_pid) {
+                        other_pids.push_back(pe.th32ProcessID);
+                    }
+                } while (Process32Next(snap, &pe));
+            }
+            CloseHandle(snap);
+
+            if (!other_pids.empty()) {
+                std::string msg = "Another slam_gui.exe is already running (PID: " +
+                    std::to_string(other_pids[0]) +
+                    ").\n\nThe LiDAR can only connect to one instance.\n\n"
+                    "Kill the existing instance and continue?";
+                int result = MessageBoxA(nullptr, msg.c_str(), "SLAM GUI - Existing Instance",
+                                         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON1);
+                if (result == IDYES) {
+                    for (DWORD pid : other_pids) {
+                        HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                        if (proc) {
+                            TerminateProcess(proc, 0);
+                            CloseHandle(proc);
+                            std::cout << "Killed existing slam_gui.exe (PID " << pid << ")" << std::endl;
+                        }
+                    }
+                    Sleep(500);  // Let the old process fully release resources
+                } else {
+                    std::cout << "User chose not to kill existing instance. Exiting." << std::endl;
+                    return 0;
+                }
+            }
+        }
+    }
 
     // Get executable directory
     char exePath[MAX_PATH];

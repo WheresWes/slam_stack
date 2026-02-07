@@ -220,6 +220,12 @@ public:
     void setRobotPose(float x, float y, float heading);
 
     /**
+     * Center camera on robot position
+     * Useful after localization to focus view on discovered position
+     */
+    void centerCameraOnRobot();
+
+    /**
      * Update LiDAR pose (triggers coverage painting in localization mode)
      * @param pose 4x4 transform matrix (column-major)
      * @param timestamp_ns Timestamp in nanoseconds

@@ -22,11 +22,26 @@
 #include <algorithm>
 #include <functional>
 #include <atomic>
+#include <iomanip>
+#include <chrono>
+#include <fstream>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
 #include "slam/types.hpp"
 #include "slam/icp.hpp"
+
+// Debug log file for SC diagnostics
+inline std::ofstream& getSCLogFile() {
+    static std::ofstream log_file("sc_debug.log", std::ios::out | std::ios::trunc);
+    return log_file;
+}
+
+#define SC_LOG(msg) do { \
+    std::cout << msg << std::endl; \
+    getSCLogFile() << msg << std::endl; \
+    getSCLogFile().flush(); \
+} while(0)
 
 namespace slam {
 
@@ -378,6 +393,391 @@ private:
 };
 
 //=============================================================================
+// Scan Context Configuration
+//=============================================================================
+
+/**
+ * @brief Configuration for Scan Context descriptor
+ *
+ * Scan Context encodes a point cloud as a 2D polar representation for
+ * fast place recognition. Optimized for Mid-360 LiDAR characteristics.
+ */
+struct ScanContextConfig {
+    int num_rings = 20;              // Radial divisions
+    int num_sectors = 60;            // Angular divisions (6 degree resolution)
+    double max_radius = 40.0;        // Maximum range (Mid-360: 40m)
+    double min_radius = 1.0;         // Minimum range (ignore close points)
+    int num_height_bands = 5;        // Vertical divisions for 3D descriptor
+    double min_height = -2.0;        // Minimum height (below sensor)
+    double max_height = 15.0;        // Maximum height (above sensor)
+};
+
+//=============================================================================
+// Scan Context Descriptor
+//=============================================================================
+
+/**
+ * @brief Scan Context descriptor for fast place recognition
+ *
+ * Encodes a point cloud as a 2D polar representation with optional
+ * height bands for 3D structure. Provides rotation-invariant matching
+ * by searching over column shifts (corresponding to yaw rotations).
+ *
+ * Key insight: Two scans from similar locations will have similar
+ * polar occupancy patterns, differing mainly by a column shift (rotation).
+ */
+class ScanContext {
+public:
+    using Descriptor = Eigen::MatrixXd;  // (num_rings × num_sectors × num_bands)
+    using RingKey = Eigen::VectorXd;     // 1D summary for fast filtering
+
+    explicit ScanContext(const ScanContextConfig& config = ScanContextConfig())
+        : config_(config) {
+        // Pre-compute ring boundaries (logarithmic spacing for better near-field resolution)
+        ring_boundaries_.resize(config_.num_rings + 1);
+        double log_min = std::log(config_.min_radius);
+        double log_max = std::log(config_.max_radius);
+        for (int i = 0; i <= config_.num_rings; i++) {
+            double t = static_cast<double>(i) / config_.num_rings;
+            ring_boundaries_[i] = std::exp(log_min + t * (log_max - log_min));
+        }
+    }
+
+    /**
+     * @brief Compute descriptor from point cloud
+     * @param cloud Input point cloud in sensor frame
+     * @return Scan Context descriptor matrix
+     */
+    Descriptor compute(const std::vector<V3D>& cloud) const {
+        if (config_.num_height_bands > 1) {
+            return compute3D(cloud);
+        } else {
+            return compute2D(cloud);
+        }
+    }
+
+    /**
+     * @brief Compute ring-key for fast candidate filtering
+     * @param desc Full descriptor
+     * @return 1D ring key (mean of each ring)
+     */
+    RingKey computeRingKey(const Descriptor& desc) const {
+        return desc.rowwise().mean();
+    }
+
+    /**
+     * @brief Match two descriptors with rotation search
+     * @param query Query descriptor
+     * @param candidate Candidate descriptor from database
+     * @return pair<similarity_score, column_shift>
+     */
+    std::pair<double, int> match(const Descriptor& query,
+                                  const Descriptor& candidate) const {
+        double best_score = -1.0;
+        int best_shift = 0;
+
+        int num_cols = static_cast<int>(query.cols());
+        int sector_cols = config_.num_sectors;
+
+        for (int shift = 0; shift < sector_cols; shift++) {
+            // Circular shift the candidate
+            Descriptor shifted(candidate.rows(), candidate.cols());
+
+            if (config_.num_height_bands > 1) {
+                // 3D descriptor: shift within each height band
+                for (int band = 0; band < config_.num_height_bands; band++) {
+                    for (int s = 0; s < sector_cols; s++) {
+                        int src_col = band * sector_cols + ((s + shift) % sector_cols);
+                        int dst_col = band * sector_cols + s;
+                        shifted.col(dst_col) = candidate.col(src_col);
+                    }
+                }
+            } else {
+                // 2D descriptor: simple column shift
+                for (int c = 0; c < num_cols; c++) {
+                    shifted.col(c) = candidate.col((c + shift) % num_cols);
+                }
+            }
+
+            double score = cosineSimilarity(query, shifted);
+            if (score > best_score) {
+                best_score = score;
+                best_shift = shift;
+            }
+        }
+
+        return {best_score, best_shift};
+    }
+
+    /**
+     * @brief Convert column shift to yaw angle
+     */
+    double shiftToYaw(int shift) const {
+        return shift * (2.0 * M_PI / config_.num_sectors);
+    }
+
+    const ScanContextConfig& config() const { return config_; }
+
+private:
+    ScanContextConfig config_;
+    std::vector<double> ring_boundaries_;
+
+    /**
+     * @brief Standard 2D Scan Context (max height per cell)
+     */
+    Descriptor compute2D(const std::vector<V3D>& cloud) const {
+        Descriptor desc = Descriptor::Zero(config_.num_rings, config_.num_sectors);
+
+        for (const auto& pt : cloud) {
+            double range = std::sqrt(pt.x() * pt.x() + pt.y() * pt.y());
+
+            if (range < config_.min_radius || range > config_.max_radius) continue;
+
+            int ring = findRing(range);
+            if (ring < 0 || ring >= config_.num_rings) continue;
+
+            double angle = std::atan2(pt.y(), pt.x());  // -π to π
+            int sector = static_cast<int>((angle + M_PI) / (2.0 * M_PI) * config_.num_sectors);
+            sector = std::clamp(sector, 0, config_.num_sectors - 1);
+
+            desc(ring, sector) = std::max(desc(ring, sector), pt.z());
+        }
+
+        // Debug: log descriptor stats
+        int nonzero = (desc.array() > 0).count();
+        double norm = Eigen::Map<const Eigen::VectorXd>(desc.data(), desc.size()).norm();
+        SC_LOG("    [SC compute2D] cloud=" << cloud.size() << " pts, desc "
+               << desc.rows() << "x" << desc.cols() << " nonzero=" << nonzero
+               << " norm=" << std::fixed << std::setprecision(2) << norm);
+
+        return desc;
+    }
+
+    /**
+     * @brief 3D Scan Context with height bands (better for outdoor/hull environments)
+     */
+    Descriptor compute3D(const std::vector<V3D>& cloud) const {
+        int total_cols = config_.num_sectors * config_.num_height_bands;
+        Descriptor desc = Descriptor::Zero(config_.num_rings, total_cols);
+
+        Eigen::MatrixXi counts = Eigen::MatrixXi::Zero(config_.num_rings, total_cols);
+
+        double height_range = config_.max_height - config_.min_height;
+        double band_height = height_range / config_.num_height_bands;
+
+        for (const auto& pt : cloud) {
+            double range = std::sqrt(pt.x() * pt.x() + pt.y() * pt.y());
+
+            if (range < config_.min_radius || range > config_.max_radius) continue;
+            if (pt.z() < config_.min_height || pt.z() > config_.max_height) continue;
+
+            int ring = findRing(range);
+            if (ring < 0 || ring >= config_.num_rings) continue;
+
+            double angle = std::atan2(pt.y(), pt.x());
+            int sector = static_cast<int>((angle + M_PI) / (2.0 * M_PI) * config_.num_sectors);
+            sector = std::clamp(sector, 0, config_.num_sectors - 1);
+
+            int band = static_cast<int>((pt.z() - config_.min_height) / band_height);
+            band = std::clamp(band, 0, config_.num_height_bands - 1);
+
+            int col = band * config_.num_sectors + sector;
+            counts(ring, col)++;
+        }
+
+        // Normalize counts to 0-1 range
+        double max_count = counts.maxCoeff();
+        if (max_count > 0) {
+            desc = counts.cast<double>() / max_count;
+        }
+
+        // Debug: log descriptor stats
+        int nonzero = (desc.array() > 0).count();
+        double norm = Eigen::Map<const Eigen::VectorXd>(desc.data(), desc.size()).norm();
+        SC_LOG("    [SC compute3D] cloud=" << cloud.size() << " pts, desc "
+               << desc.rows() << "x" << desc.cols() << " nonzero=" << nonzero
+               << " max=" << max_count << " norm=" << std::fixed << std::setprecision(2) << norm);
+
+        return desc;
+    }
+
+    int findRing(double range) const {
+        auto it = std::lower_bound(ring_boundaries_.begin(), ring_boundaries_.end(), range);
+        int idx = static_cast<int>(it - ring_boundaries_.begin()) - 1;
+        return std::clamp(idx, 0, config_.num_rings - 1);
+    }
+
+    double cosineSimilarity(const Descriptor& a, const Descriptor& b) const {
+        Eigen::VectorXd va = Eigen::Map<const Eigen::VectorXd>(a.data(), a.size());
+        Eigen::VectorXd vb = Eigen::Map<const Eigen::VectorXd>(b.data(), b.size());
+
+        double dot = va.dot(vb);
+        double norm_a = va.norm();
+        double norm_b = vb.norm();
+
+        if (norm_a < 1e-10 || norm_b < 1e-10) return 0.0;
+
+        return dot / (norm_a * norm_b);
+    }
+};
+
+//=============================================================================
+// Scan Context Database
+//=============================================================================
+
+/**
+ * @brief Database of Scan Context descriptors for place recognition
+ *
+ * Stores keyframe descriptors with spatial indexing. Supports fast
+ * querying using ring-key pre-filtering followed by full descriptor matching.
+ */
+class ScanContextDatabase {
+public:
+    struct KeyFrame {
+        int id;
+        V3D position;
+        double yaw;
+        ScanContext::Descriptor descriptor;
+        ScanContext::RingKey ring_key;
+    };
+
+    struct Match {
+        int keyframe_id;
+        V3D position;
+        double yaw_estimate;
+        double score;
+    };
+
+    explicit ScanContextDatabase(const ScanContextConfig& config = ScanContextConfig())
+        : sc_(config), config_(config), min_keyframe_distance_(5.0) {}
+
+    /**
+     * @brief Add a keyframe to the database
+     * @param scan Point cloud in LOCAL/SENSOR frame (relative to keyframe position)
+     * @param pose Pose of this keyframe in world frame
+     * @return true if added (false if too close to existing keyframe)
+     */
+    bool addKeyFrame(const std::vector<V3D>& scan, const M4D& pose) {
+        V3D position(pose(0, 3), pose(1, 3), pose(2, 3));
+
+        // Check if too close to existing keyframe
+        for (const auto& kf : keyframes_) {
+            if ((position - kf.position).head<2>().norm() < min_keyframe_distance_) {
+                return false;
+            }
+        }
+
+        if (scan.size() < 100) {
+            return false;  // Not enough points
+        }
+
+        // Compute descriptor from sensor-frame scan
+        KeyFrame kf;
+        kf.id = static_cast<int>(keyframes_.size());
+        kf.position = position;
+        kf.yaw = std::atan2(pose(1, 0), pose(0, 0));
+        kf.descriptor = sc_.compute(scan);
+        kf.ring_key = sc_.computeRingKey(kf.descriptor);
+
+        keyframes_.push_back(kf);
+        return true;
+    }
+
+    /**
+     * @brief Query database for matching locations
+     * @param scan Query scan in sensor frame
+     * @param top_k Number of candidates to return
+     * @return Vector of matches sorted by score (descending)
+     */
+    std::vector<Match> query(const std::vector<V3D>& scan, int top_k = 20) const {
+        SC_LOG("  [SC query] scan=" << scan.size() << " pts, keyframes=" << keyframes_.size());
+        if (keyframes_.empty() || scan.size() < 100) {
+            SC_LOG("  [SC query] EARLY EXIT: empty keyframes or scan too small");
+            return {};
+        }
+
+        // Compute query descriptor
+        SC_LOG("  [SC query] Computing query descriptor...");
+        auto query_desc = sc_.compute(scan);
+        auto query_ring_key = sc_.computeRingKey(query_desc);
+
+        // Log query descriptor stats
+        int q_nonzero = (query_desc.array() > 0).count();
+        double q_norm = Eigen::Map<const Eigen::VectorXd>(query_desc.data(), query_desc.size()).norm();
+        SC_LOG("  [SC query] Query desc: " << query_desc.rows() << "x" << query_desc.cols()
+               << " nonzero=" << q_nonzero << " norm=" << std::fixed << std::setprecision(2) << q_norm);
+
+        // Pre-filter with ring key distance (fast)
+        std::vector<std::pair<int, double>> ring_distances;
+        ring_distances.reserve(keyframes_.size());
+
+        for (const auto& kf : keyframes_) {
+            double dist = (query_ring_key - kf.ring_key).norm();
+            ring_distances.push_back({kf.id, dist});
+        }
+
+        // Sort by ring distance (ascending)
+        std::sort(ring_distances.begin(), ring_distances.end(),
+                 [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        // Full matching on top candidates (3x top_k for filtering margin)
+        int num_to_match = std::min(static_cast<int>(ring_distances.size()), top_k * 3);
+        std::vector<Match> matches;
+        matches.reserve(num_to_match);
+
+        for (int i = 0; i < num_to_match; i++) {
+            const auto& kf = keyframes_[ring_distances[i].first];
+
+            auto [score, shift] = sc_.match(query_desc, kf.descriptor);
+
+            // Log first few matches for debugging
+            if (i < 5) {
+                int kf_nonzero = (kf.descriptor.array() > 0).count();
+                double kf_norm = Eigen::Map<const Eigen::VectorXd>(kf.descriptor.data(), kf.descriptor.size()).norm();
+                SC_LOG("  [SC match " << i << "] kf=" << kf.id << " kf_nonzero=" << kf_nonzero
+                       << " kf_norm=" << std::fixed << std::setprecision(2) << kf_norm
+                       << " => score=" << std::setprecision(4) << score << " shift=" << shift);
+            }
+
+            double yaw_offset = sc_.shiftToYaw(shift);
+            double estimated_yaw = kf.yaw + yaw_offset;
+
+            // Normalize to [-π, π]
+            while (estimated_yaw > M_PI) estimated_yaw -= 2.0 * M_PI;
+            while (estimated_yaw < -M_PI) estimated_yaw += 2.0 * M_PI;
+
+            matches.push_back({kf.id, kf.position, estimated_yaw, score});
+        }
+
+        // Sort by score (descending)
+        std::sort(matches.begin(), matches.end(),
+                 [](const Match& a, const Match& b) { return a.score > b.score; });
+
+        // Return top_k
+        if (matches.size() > static_cast<size_t>(top_k)) {
+            matches.resize(top_k);
+        }
+
+        return matches;
+    }
+
+    size_t size() const { return keyframes_.size(); }
+    bool empty() const { return keyframes_.empty(); }
+    void clear() { keyframes_.clear(); }
+
+    void setMinKeyFrameDistance(double dist) { min_keyframe_distance_ = dist; }
+    double getMinKeyFrameDistance() const { return min_keyframe_distance_; }
+
+    const KeyFrame& getKeyFrame(int id) const { return keyframes_[id]; }
+
+private:
+    ScanContext sc_;
+    ScanContextConfig config_;
+    std::vector<KeyFrame> keyframes_;
+    double min_keyframe_distance_;
+};
+
+//=============================================================================
 // Progressive Global Localizer Configuration
 //=============================================================================
 
@@ -388,15 +788,34 @@ struct ProgressiveLocalizerConfig {
     int max_attempts = 10;             // Max localization attempts
 
     // Grid search parameters (for global localization)
-    double grid_step = 2.0;            // meters
-    double yaw_step_deg = 30.0;        // degrees
+    double grid_step = 2.0;            // meters (1.0m when using hint for finer search)
+    double yaw_step_deg = 30.0;        // degrees (15° when using hint for finer search)
     bool search_z = false;             // Search in Z (usually false for ground robots)
     double z_value = 0.0;              // Fixed Z value if not searching
+
+    // Position hint for bounded search (CRITICAL for reliable localization)
+    bool use_hint = false;             // If true, search only within hint bounds
+    double hint_x = 0.0;               // Hint position X (map frame)
+    double hint_y = 0.0;               // Hint position Y (map frame)
+    double hint_radius = 10.0;         // Search radius around hint (meters)
+    double hint_heading = 0.0;         // Heading direction (radians, 0 = +X)
+    bool hint_heading_known = false;   // If true, search only ±60° around heading
+    double hint_heading_range = M_PI / 3.0;  // ±60° if heading known
 
     // ICP parameters
     double coarse_voxel = 0.5;
     double medium_voxel = 0.2;
     double fine_voxel = 0.1;
+
+    // Scan Context parameters (fast place recognition before ICP)
+    // NOTE: SC disabled - not suitable for outdoor dry dock scenario with partial views
+    // Grid search + multi-hypothesis ICP works better with surrounding dock structure
+    bool use_scan_context = false;         // Disabled - use grid search instead
+    ScanContextConfig sc_config;           // Descriptor configuration
+    int sc_top_candidates = 50;            // Max candidates from SC query
+    double sc_min_score = 0.05;            // Minimum SC match score (lowered for testing)
+    double sc_confident_score = 0.3;       // High-confidence SC match
+    double keyframe_spacing = 5.0;         // Meters between keyframes in database
 };
 
 //=============================================================================
@@ -472,6 +891,120 @@ public:
                   << prebuilt_map_points_.size() << " points" << std::endl;
         std::cout << "  Bounds: [" << prebuilt_min_.transpose() << "] to ["
                   << prebuilt_max_.transpose() << "]" << std::endl;
+
+        // Build Scan Context keyframe database if enabled
+        if (config_.use_scan_context) {
+            buildScanContextDatabase();
+        }
+    }
+
+    /**
+     * @brief Build Scan Context keyframe database from pre-built map
+     *
+     * Samples keyframe positions across the map and computes descriptors
+     * for each. This enables fast place recognition before ICP.
+     */
+    void buildScanContextDatabase() {
+        sc_database_ = ScanContextDatabase(config_.sc_config);
+        sc_database_.setMinKeyFrameDistance(config_.keyframe_spacing);
+
+        double max_radius = config_.sc_config.max_radius;
+        double spacing = config_.keyframe_spacing;
+
+        SC_LOG("[ScanContext] Building keyframe database...");
+        SC_LOG("  Keyframe spacing: " << spacing << "m");
+        SC_LOG("  Descriptor radius: " << max_radius << "m");
+        SC_LOG("  Map bounds: X[" << prebuilt_min_.x() << "," << prebuilt_max_.x()
+                  << "] Y[" << prebuilt_min_.y() << "," << prebuilt_max_.y() << "]");
+
+        double map_width = prebuilt_max_.x() - prebuilt_min_.x();
+        double map_height = prebuilt_max_.y() - prebuilt_min_.y();
+        SC_LOG("  Map size: " << map_width << "m x " << map_height << "m");
+
+        auto t_start = std::chrono::high_resolution_clock::now();
+
+        // Sample keyframe positions on a grid
+        int keyframes_added = 0;
+        int positions_tested = 0;
+
+        // Use slightly smaller step than spacing to ensure good coverage
+        double step = spacing * 0.9;
+
+        // Use a smaller margin (10% of radius) to allow keyframes closer to edges
+        // The descriptor will just have fewer points on the edge sides
+        double margin = std::min(max_radius * 0.1, 5.0);  // Max 5m margin
+
+        double x_start = prebuilt_min_.x() + margin;
+        double x_end = prebuilt_max_.x() - margin;
+        double y_start = prebuilt_min_.y() + margin;
+        double y_end = prebuilt_max_.y() - margin;
+
+        SC_LOG("  Keyframe grid: X[" << x_start << "," << x_end
+                  << "] Y[" << y_start << "," << y_end << "] step=" << step << "m");
+
+        // Check if map is too small
+        if (x_end <= x_start || y_end <= y_start) {
+            SC_LOG("  WARNING: Map too small for keyframes!");
+            return;
+        }
+
+        for (double kf_x = x_start; kf_x <= x_end; kf_x += step) {
+            for (double kf_y = y_start; kf_y <= y_end; kf_y += step) {
+                positions_tested++;
+
+                // Extract points within max_radius of this keyframe position
+                std::vector<V3D> local_scan;
+                local_scan.reserve(10000);
+
+                double kf_z = 0.0;  // Sensor height (assume ground-level)
+                int z_count = 0;
+
+                for (const auto& pt : prebuilt_map_points_) {
+                    double dx = pt.x() - kf_x;
+                    double dy = pt.y() - kf_y;
+                    double range_2d = std::sqrt(dx * dx + dy * dy);
+
+                    if (range_2d <= max_radius) {
+                        // Transform to sensor frame (relative to keyframe position)
+                        local_scan.emplace_back(dx, dy, pt.z() - kf_z);
+
+                        // Estimate average Z for this region
+                        if (pt.z() < 0.5) {  // Ground points
+                            kf_z += pt.z();
+                            z_count++;
+                        }
+                    }
+                }
+
+                // Use average ground height as sensor Z (sensor is ~0.5m above ground)
+                if (z_count > 0) {
+                    double ground_z = kf_z / z_count;
+                    kf_z = ground_z + 0.5;  // Sensor is 0.5m above ground
+                }
+
+                // Only add keyframe if we have enough points (lowered threshold for indoor)
+                if (local_scan.size() < 100) continue;
+
+                // Create pose for this keyframe (yaw=0 since we don't know orientation)
+                M4D kf_pose = M4D::Identity();
+                kf_pose(0, 3) = kf_x;
+                kf_pose(1, 3) = kf_y;
+                kf_pose(2, 3) = kf_z;
+
+                if (sc_database_.addKeyFrame(local_scan, kf_pose)) {
+                    keyframes_added++;
+                }
+            }
+        }
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double build_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+        SC_LOG("  Positions tested: " << positions_tested);
+        SC_LOG("  Keyframes added: " << keyframes_added);
+        SC_LOG("  Build time: " << std::fixed << std::setprecision(0)
+                  << build_time_ms << "ms");
+        SC_LOG("  SC database size: " << sc_database_.size());
     }
 
     /**
@@ -595,15 +1128,36 @@ public:
         std::cout << "  Coverage: " << result.rotation_deg << " deg rotation, "
                   << result.distance_m << " m traveled" << std::endl;
 
-        // Convert local map to V3D
+        // CRITICAL: Re-center local map around robot's CURRENT position
+        // This allows the hint to represent "where is the robot NOW" (user expectation)
+        // rather than "where did the robot START" (SLAM frame origin)
+        V3D robot_position(current_pose(0, 3), current_pose(1, 3), current_pose(2, 3));
+        std::cout << "  Robot current local pos: (" << robot_position.x() << ", "
+                  << robot_position.y() << ", " << robot_position.z() << ")" << std::endl;
+
+        // Convert local map to V3D, re-centered around robot's current position
         std::vector<V3D> local_points;
         local_points.reserve(local_map_points.size());
         for (const auto& pt : local_map_points) {
-            local_points.emplace_back(pt.x, pt.y, pt.z);
+            // Shift points so robot's current position becomes origin
+            local_points.emplace_back(
+                pt.x - robot_position.x(),
+                pt.y - robot_position.y(),
+                pt.z - robot_position.z()
+            );
         }
 
+        // Log re-centering effect
+        V3D new_min(1e9, 1e9, 1e9), new_max(-1e9, -1e9, -1e9);
+        for (const auto& pt : local_points) {
+            new_min = new_min.cwiseMin(pt);
+            new_max = new_max.cwiseMax(pt);
+        }
+        std::cout << "  Re-centered local map: [" << new_min.x() << "," << new_max.x()
+                  << "] x [" << new_min.y() << "," << new_max.y() << "]" << std::endl;
+
         // Run global localization with progress
-        auto [transform, confidence] = attemptGlobalLocalizationWithProgress(
+        auto [transform_recentered, confidence] = attemptGlobalLocalizationWithProgress(
             local_points, progress_callback);
 
         // Check for cancellation
@@ -613,6 +1167,22 @@ public:
             result.message = "Localization cancelled";
             return result;
         }
+
+        // CRITICAL: Adjust transform to account for re-centering
+        // ICP found transform_recentered: maps recentered local points -> map frame
+        // We need transform that maps odom points -> map frame
+        // Chain: odom -> recentered -> map
+        //   recentered_point = odom_point - robot_position
+        //   map_point = transform_recentered * recentered_point
+        // So: T_odom_to_map = transform_recentered * T_odom_to_recentered
+        // where T_odom_to_recentered = [I | -robot_position]
+        M4D T_odom_to_recentered = M4D::Identity();
+        T_odom_to_recentered(0, 3) = -robot_position.x();
+        T_odom_to_recentered(1, 3) = -robot_position.y();
+        T_odom_to_recentered(2, 3) = -robot_position.z();
+
+        M4D transform = transform_recentered * T_odom_to_recentered;
+        std::cout << "  Transform adjusted for robot movement" << std::endl;
 
         result.transform = transform;
         result.confidence = confidence;
@@ -745,11 +1315,173 @@ private:
 
         std::cout << "  Generating hypotheses..." << std::flush;
 
-        // Generate hypotheses via grid search
+        // Generate hypotheses
         std::vector<std::pair<M4D, double>> hypotheses;
+        int total_hypotheses = 0;  // For progress reporting
 
-        double yaw_step = config_.yaw_step_deg * M_PI / 180.0;
-        int num_yaws = static_cast<int>(std::ceil(2 * M_PI / yaw_step));
+        // === Try Scan Context first (fast place recognition) ===
+        bool sc_found_candidates = false;
+        SC_LOG("  [ScanContext] use_scan_context=" << config_.use_scan_context
+               << " database_size=" << sc_database_.size());
+        if (config_.use_scan_context && !sc_database_.empty()) {
+            SC_LOG("\n  [ScanContext] Querying database (" << sc_database_.size()
+                      << " keyframes)...");
+
+            auto sc_matches = sc_database_.query(local_map, config_.sc_top_candidates);
+
+            SC_LOG("  [ScanContext] Found " << sc_matches.size() << " matches");
+
+            // Log all match scores for debugging
+            SC_LOG("  [ScanContext] Match scores (threshold=" << config_.sc_min_score << "):");
+            for (size_t i = 0; i < sc_matches.size() && i < 10; i++) {
+                SC_LOG("    Match[" << i << "]: score=" << std::fixed << std::setprecision(3)
+                       << sc_matches[i].score << " kf=" << sc_matches[i].keyframe_id
+                       << " pos=(" << sc_matches[i].position.x() << ","
+                       << sc_matches[i].position.y() << ")");
+            }
+
+            int good_matches = 0;
+            int rejected_bounds = 0;
+            int rejected_hint = 0;
+            int rejected_score = 0;
+
+            for (const auto& match : sc_matches) {
+                // Physical plausibility check 1: Score threshold
+                if (match.score < config_.sc_min_score) {
+                    rejected_score++;
+                    continue;
+                }
+
+                // Physical plausibility check 2: Within map bounds (no margin - keyframes already have margin)
+                if (match.position.x() < prebuilt_min_.x() ||
+                    match.position.x() > prebuilt_max_.x() ||
+                    match.position.y() < prebuilt_min_.y() ||
+                    match.position.y() > prebuilt_max_.y()) {
+                    rejected_bounds++;
+                    continue;
+                }
+
+                // Physical plausibility check 3: If using hint, check distance
+                if (config_.use_hint) {
+                    double dx = match.position.x() - config_.hint_x;
+                    double dy = match.position.y() - config_.hint_y;
+                    double hint_dist = std::sqrt(dx * dx + dy * dy);
+
+                    // Allow 2x hint radius for SC (it's approximate)
+                    if (hint_dist > config_.hint_radius * 2.0) {
+                        rejected_hint++;
+                        continue;
+                    }
+                }
+
+                good_matches++;
+
+                // Convert SC match to hypothesis pose
+                // SC provides: position and estimated yaw from descriptor matching
+                M4D pose = M4D::Identity();
+                pose(0, 0) = std::cos(match.yaw_estimate);
+                pose(0, 1) = -std::sin(match.yaw_estimate);
+                pose(1, 0) = std::sin(match.yaw_estimate);
+                pose(1, 1) = std::cos(match.yaw_estimate);
+                pose(0, 3) = match.position.x();
+                pose(1, 3) = match.position.y();
+                pose(2, 3) = match.position.z();
+
+                // Score using voxel occupancy (same as grid search)
+                double voxel_score = prebuilt_voxels_.scoreHypothesis(local_coarse, pose);
+
+                // Boost score based on SC confidence
+                double combined_score = voxel_score * (0.5 + 0.5 * match.score);
+
+                hypotheses.emplace_back(pose, combined_score);
+
+                SC_LOG("    SC[" << match.keyframe_id << "]: pos=("
+                          << std::fixed << std::setprecision(1)
+                          << match.position.x() << "," << match.position.y()
+                          << ") yaw=" << (match.yaw_estimate * 180.0 / M_PI)
+                          << "deg SC=" << std::setprecision(2) << (match.score * 100)
+                          << "% vox=" << (voxel_score * 100) << "%");
+            }
+
+            // Log rejection statistics
+            if (rejected_score + rejected_bounds + rejected_hint > 0) {
+                SC_LOG("  [ScanContext] Rejected: " << rejected_score << " low-score, "
+                          << rejected_bounds << " out-of-bounds, "
+                          << rejected_hint << " far-from-hint");
+            }
+
+            if (good_matches >= 3) {
+                sc_found_candidates = true;
+                total_hypotheses = good_matches;  // For progress reporting
+                SC_LOG("  [ScanContext] Using " << good_matches
+                          << " SC candidates (skipping grid search)");
+            } else {
+                SC_LOG("  [ScanContext] Only " << good_matches
+                          << " good matches");
+                // TEMP: Don't fall back - force SC-only mode for testing
+                if (good_matches > 0) {
+                    sc_found_candidates = true;
+                    total_hypotheses = good_matches;
+                    SC_LOG("  [ScanContext] FORCING SC-only mode (grid search disabled for testing)");
+                } else {
+                    SC_LOG("  [ScanContext] ERROR: No SC matches and grid search disabled!");
+                    std::cout << "  [ScanContext] Check: Is the SC database empty? Did map loading work?" << std::endl;
+                    reportProgress(callback, LocalizationStage::COMPLETE,
+                                  1.0f, 1.0f, "SC failed - no candidates!");
+                    return {M4D::Identity(), 0.0};
+                }
+            }
+        }
+
+        // === Fall back to grid search if SC didn't find enough ===
+        // Grid search: primary method for dry dock scenario (SC disabled)
+        if (!sc_found_candidates) {
+            double yaw_step = config_.yaw_step_deg * M_PI / 180.0;
+
+        // Determine search bounds (hint-based or full map)
+        double x_min, x_max, y_min, y_max;
+        double yaw_min, yaw_max;
+
+        if (config_.use_hint) {
+            // Bounded search around hint position
+            x_min = config_.hint_x - config_.hint_radius;
+            x_max = config_.hint_x + config_.hint_radius;
+            y_min = config_.hint_y - config_.hint_radius;
+            y_max = config_.hint_y + config_.hint_radius;
+
+            // Clamp to map bounds
+            x_min = std::max(x_min, prebuilt_min_.x());
+            x_max = std::min(x_max, prebuilt_max_.x());
+            y_min = std::max(y_min, prebuilt_min_.y());
+            y_max = std::min(y_max, prebuilt_max_.y());
+
+            if (config_.hint_heading_known) {
+                // Search ±heading_range around hint heading
+                yaw_min = config_.hint_heading - config_.hint_heading_range;
+                yaw_max = config_.hint_heading + config_.hint_heading_range;
+            } else {
+                // Search all headings
+                yaw_min = 0.0;
+                yaw_max = 2.0 * M_PI;
+            }
+
+            std::cout << "  Hint-bounded search: X[" << x_min << "," << x_max
+                      << "] Y[" << y_min << "," << y_max << "]"
+                      << " Yaw[" << (yaw_min * 180.0 / M_PI) << "," << (yaw_max * 180.0 / M_PI) << "]deg"
+                      << std::endl;
+        } else {
+            // Full map search
+            x_min = prebuilt_min_.x();
+            x_max = prebuilt_max_.x();
+            y_min = prebuilt_min_.y();
+            y_max = prebuilt_max_.y();
+            yaw_min = 0.0;
+            yaw_max = 2.0 * M_PI;
+            std::cout << "  Full map search (no hint)" << std::endl;
+        }
+
+        int num_yaws = static_cast<int>(std::ceil((yaw_max - yaw_min) / yaw_step));
+        if (num_yaws < 1) num_yaws = 1;
 
         // Determine Z value
         double z_val = config_.search_z ?
@@ -757,23 +1489,37 @@ private:
             config_.z_value;
 
         // Count total hypotheses for progress
-        double x_range = prebuilt_max_.x() - prebuilt_min_.x();
-        double y_range = prebuilt_max_.y() - prebuilt_min_.y();
+        double x_range = x_max - x_min;
+        double y_range = y_max - y_min;
         int x_steps = static_cast<int>(std::ceil(x_range / config_.grid_step)) + 1;
         int y_steps = static_cast<int>(std::ceil(y_range / config_.grid_step)) + 1;
-        int total_hypotheses = x_steps * y_steps * num_yaws;
+        total_hypotheses = x_steps * y_steps * num_yaws;  // Update outer variable
         int processed_hypotheses = 0;
 
-        // Grid search over pre-built map bounds
-        for (double x = prebuilt_min_.x(); x <= prebuilt_max_.x(); x += config_.grid_step) {
+        std::cout << "  Grid: " << x_steps << "x" << y_steps << "x" << num_yaws
+                  << " = " << total_hypotheses << " hypotheses" << std::endl;
+
+        // Grid search over bounds
+        for (double x = x_min; x <= x_max; x += config_.grid_step) {
             // Check for cancellation
             if (cancel_requested_.load()) {
                 return {M4D::Identity(), 0.0};
             }
 
-            for (double y = prebuilt_min_.y(); y <= prebuilt_max_.y(); y += config_.grid_step) {
+            for (double y = y_min; y <= y_max; y += config_.grid_step) {
+                // Skip candidates outside circular hint region (if using hint)
+                if (config_.use_hint) {
+                    double dx = x - config_.hint_x;
+                    double dy = y - config_.hint_y;
+                    if (dx * dx + dy * dy > config_.hint_radius * config_.hint_radius) {
+                        // Outside circle, but still count for progress
+                        processed_hypotheses += num_yaws;
+                        continue;
+                    }
+                }
+
                 for (int yi = 0; yi < num_yaws; yi++) {
-                    double yaw = yi * yaw_step;
+                    double yaw = yaw_min + yi * yaw_step;
 
                     M4D pose = M4D::Identity();
                     pose(0, 0) = std::cos(yaw);
@@ -803,6 +1549,7 @@ private:
                           overall_prog, stage_prog, buf,
                           total_hypotheses, static_cast<int>(hypotheses.size()));
         }
+        } // end if (!sc_found_candidates)
 
         std::cout << " " << hypotheses.size() << " candidates" << std::endl;
 
@@ -813,153 +1560,294 @@ private:
             return {M4D::Identity(), 0.0};
         }
 
-        // Sort by score descending
+        // Sort by voxel score descending
         std::sort(hypotheses.begin(), hypotheses.end(),
                   [](const auto& a, const auto& b) { return a.second > b.second; });
 
-        std::cout << "  Top hypothesis score: " << (hypotheses[0].second * 100) << "%"
-                  << std::endl;
+        // Log top hypotheses for debugging
+        std::cout << "\n=== LOCALIZATION LOG ===" << std::endl;
+        std::cout << "  Total hypotheses generated: " << hypotheses.size() << std::endl;
+        std::cout << "  Top 10 by voxel score:" << std::endl;
+        for (size_t i = 0; i < std::min(size_t(10), hypotheses.size()); i++) {
+            const auto& hyp = hypotheses[i];
+            double x = hyp.first(0, 3);
+            double y = hyp.first(1, 3);
+            double yaw = std::atan2(hyp.first(1, 0), hyp.first(0, 0)) * 180.0 / M_PI;
+            std::cout << "    [" << i << "] pos=(" << std::fixed << std::setprecision(2)
+                      << x << "," << y << ") yaw=" << std::setprecision(1) << yaw
+                      << "deg score=" << std::setprecision(1) << (hyp.second * 100) << "%" << std::endl;
+        }
 
-        // Refine top hypothesis with coarse-to-fine ICP
-        M4D best_pose = hypotheses[0].first;
-        double best_hyp_score = hypotheses[0].second;
+        // === Stage 2: Multi-hypothesis coarse ICP (20-50%) ===
+        // Refine top N hypotheses (not just top 1) for reliability
+        const int NUM_TO_REFINE = std::min(20, static_cast<int>(hypotheses.size()));
+        std::cout << "\n  Refining top " << NUM_TO_REFINE << " hypotheses with coarse ICP..." << std::endl;
 
-        // === Stage 2: Coarse ICP (20-45%) ===
-        if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+        // Struct to hold refined candidates
+        struct RefinedCandidate {
+            M4D pose;
+            double voxel_score;
+            double coarse_fitness;
+            double final_fitness;
+            int original_rank;
+        };
+        std::vector<RefinedCandidate> refined_candidates;
+        refined_candidates.reserve(NUM_TO_REFINE);
 
-        std::cout << "  Coarse ICP..." << std::flush;
-        reportProgress(callback, LocalizationStage::COARSE_ICP,
-                      0.20f, 0.0f, "Starting coarse alignment...",
-                      total_hypotheses, static_cast<int>(hypotheses.size()),
-                      best_hyp_score);
-        double coarse_fitness = 0.0;
-        {
-            auto scan_down = voxelDownsample(local_map, config_.coarse_voxel);
-            auto map_down = voxelDownsample(prebuilt_map_points_, config_.coarse_voxel);
+        // Downsample once for coarse ICP
+        auto scan_coarse = voxelDownsample(local_map, config_.coarse_voxel);
+        auto map_coarse = voxelDownsample(prebuilt_map_points_, config_.coarse_voxel);
 
+        for (int h = 0; h < NUM_TO_REFINE; h++) {
+            if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+
+            M4D pose = hypotheses[h].first;
+            double voxel_score = hypotheses[h].second;
+
+            // Quick coarse ICP (fewer iterations since we're testing many)
             ICPConfig cfg;
-            cfg.max_iterations = 30;
+            cfg.max_iterations = 15;  // Reduced from 30 - just enough to converge
             cfg.max_correspondence_dist = 3.0;
             cfg.convergence_threshold = 1e-4;
 
             ICP icp(cfg);
-            // Run ICP with iteration tracking
+            double coarse_fitness = 0.0;
             for (int i = 0; i < cfg.max_iterations; i++) {
-                if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
-
-                auto result = icp.alignOneIteration(scan_down, map_down, best_pose);
-                best_pose = result.transformation;
+                auto result = icp.alignOneIteration(scan_coarse, map_coarse, pose);
+                pose = result.transformation;
                 coarse_fitness = result.fitness_score;
-
-                float stage_prog = static_cast<float>(i + 1) / cfg.max_iterations;
-                float overall_prog = 0.20f + stage_prog * 0.25f;
-                char buf[128];
-                snprintf(buf, sizeof(buf), "Coarse ICP: iteration %d/%d (%.1f%% fitness)",
-                        i + 1, cfg.max_iterations, coarse_fitness * 100);
-                reportProgress(callback, LocalizationStage::COARSE_ICP,
-                              overall_prog, stage_prog, buf,
-                              total_hypotheses, static_cast<int>(hypotheses.size()),
-                              best_hyp_score, coarse_fitness, i + 1, cfg.max_iterations);
-
                 if (result.converged) break;
             }
-            std::cout << " fitness=" << (coarse_fitness * 100) << "%" << std::endl;
+
+            // Log this candidate
+            double x = pose(0, 3);
+            double y = pose(1, 3);
+            double yaw = std::atan2(pose(1, 0), pose(0, 0)) * 180.0 / M_PI;
+            std::cout << "    [" << h << "] after coarse ICP: pos=(" << std::fixed << std::setprecision(2)
+                      << x << "," << y << ") yaw=" << std::setprecision(1) << yaw
+                      << "deg voxel=" << (voxel_score * 100) << "% fit=" << (coarse_fitness * 100) << "%" << std::endl;
+
+            refined_candidates.push_back({pose, voxel_score, coarse_fitness, 0.0, h});
+
+            // Update progress
+            float stage_prog = static_cast<float>(h + 1) / NUM_TO_REFINE;
+            float overall_prog = 0.20f + stage_prog * 0.30f;
+            char buf[128];
+            snprintf(buf, sizeof(buf), "Coarse ICP: %d/%d hypotheses (best: %.1f%%)",
+                    h + 1, NUM_TO_REFINE, coarse_fitness * 100);
+            reportProgress(callback, LocalizationStage::COARSE_ICP,
+                          overall_prog, stage_prog, buf,
+                          total_hypotheses, NUM_TO_REFINE);
         }
 
-        // === Stage 3: Medium ICP (45-70%) ===
-        if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+        // Sort by coarse fitness
+        std::sort(refined_candidates.begin(), refined_candidates.end(),
+                  [](const auto& a, const auto& b) { return a.coarse_fitness > b.coarse_fitness; });
 
-        std::cout << "  Medium ICP..." << std::flush;
-        reportProgress(callback, LocalizationStage::MEDIUM_ICP,
-                      0.45f, 0.0f, "Starting medium refinement...",
-                      total_hypotheses, static_cast<int>(hypotheses.size()),
-                      best_hyp_score, coarse_fitness);
-        double medium_fitness = 0.0;
+        std::cout << "\n  Top 5 after coarse ICP:" << std::endl;
+        for (size_t i = 0; i < std::min(size_t(5), refined_candidates.size()); i++) {
+            const auto& c = refined_candidates[i];
+            double x = c.pose(0, 3);
+            double y = c.pose(1, 3);
+            double yaw = std::atan2(c.pose(1, 0), c.pose(0, 0)) * 180.0 / M_PI;
+            std::cout << "    [" << i << "] pos=(" << std::fixed << std::setprecision(2)
+                      << x << "," << y << ") yaw=" << std::setprecision(1) << yaw
+                      << "deg coarse_fit=" << (c.coarse_fitness * 100) << "% (orig rank " << c.original_rank << ")" << std::endl;
+        }
+
+        // === Stage 3: Medium ICP on top 5 (50-75%) ===
+        // Use MEDIUM voxels (0.2m) for quick comparison - much faster than fine!
+        const int NUM_MEDIUM = std::min(5, static_cast<int>(refined_candidates.size()));
+        std::cout << "\n  Running medium ICP on top " << NUM_MEDIUM << " candidates..." << std::endl;
+
+        auto t_medium_start = std::chrono::high_resolution_clock::now();
+        auto scan_medium = voxelDownsample(local_map, config_.medium_voxel);  // 0.2m voxels
+
+        // CRITICAL OPTIMIZATION: Crop prebuilt map based on COARSE ICP results
+        // The coarse stage has already narrowed down positions - use that info!
+        std::vector<V3D> map_cropped_medium;
         {
-            auto scan_down = voxelDownsample(local_map, config_.medium_voxel);
-            auto map_down = voxelDownsample(prebuilt_map_points_, config_.medium_voxel);
+            // Compute bounding box of top candidates from coarse ICP
+            double crop_x_min = 1e9, crop_x_max = -1e9;
+            double crop_y_min = 1e9, crop_y_max = -1e9;
+            for (const auto& c : refined_candidates) {
+                crop_x_min = std::min(crop_x_min, c.pose(0, 3));
+                crop_x_max = std::max(crop_x_max, c.pose(0, 3));
+                crop_y_min = std::min(crop_y_min, c.pose(1, 3));
+                crop_y_max = std::max(crop_y_max, c.pose(1, 3));
+            }
+            // Add margin for local map extent and ICP convergence
+            double margin = 20.0;  // Covers local map size + ICP drift
+            crop_x_min -= margin; crop_x_max += margin;
+            crop_y_min -= margin; crop_y_max += margin;
+
+            std::cout << "    Medium ICP crop region: [" << crop_x_min << "," << crop_x_max
+                      << "] x [" << crop_y_min << "," << crop_y_max << "]" << std::endl;
+
+            map_cropped_medium.reserve(prebuilt_map_points_.size() / 4);
+            for (const auto& pt : prebuilt_map_points_) {
+                if (pt.x() >= crop_x_min && pt.x() <= crop_x_max &&
+                    pt.y() >= crop_y_min && pt.y() <= crop_y_max) {
+                    map_cropped_medium.push_back(pt);
+                }
+            }
+            std::cout << "    Cropped prebuilt map from " << prebuilt_map_points_.size()
+                      << " to " << map_cropped_medium.size() << " points" << std::endl;
+        }
+        auto map_medium = voxelDownsample(map_cropped_medium, config_.medium_voxel);
+        std::cout << "    Downsampled: scan=" << scan_medium.size() << " map=" << map_medium.size() << " points" << std::endl;
+
+        for (int h = 0; h < NUM_MEDIUM; h++) {
+            if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+
+            auto& candidate = refined_candidates[h];
 
             ICPConfig cfg;
-            cfg.max_iterations = 40;
-            cfg.max_correspondence_dist = 1.5;
+            cfg.max_iterations = 20;  // Reduced from 40
+            cfg.max_correspondence_dist = 0.6;
             cfg.convergence_threshold = 1e-5;
 
             ICP icp(cfg);
-            for (int i = 0; i < cfg.max_iterations; i++) {
-                if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+            auto result = icp.align(scan_medium, map_medium, candidate.pose);
+            candidate.pose = result.transformation;
+            candidate.final_fitness = result.fitness_score;
 
-                auto result = icp.alignOneIteration(scan_down, map_down, best_pose);
-                best_pose = result.transformation;
-                medium_fitness = result.fitness_score;
+            // Log result
+            double x = candidate.pose(0, 3);
+            double y = candidate.pose(1, 3);
+            double yaw = std::atan2(candidate.pose(1, 0), candidate.pose(0, 0)) * 180.0 / M_PI;
+            std::cout << "    [" << h << "] medium: pos=(" << std::fixed << std::setprecision(2)
+                      << x << "," << y << ") yaw=" << std::setprecision(1) << yaw
+                      << "deg fit=" << (candidate.final_fitness * 100) << "%" << std::endl;
 
-                float stage_prog = static_cast<float>(i + 1) / cfg.max_iterations;
-                float overall_prog = 0.45f + stage_prog * 0.25f;
-                char buf[128];
-                snprintf(buf, sizeof(buf), "Medium ICP: iteration %d/%d (%.1f%% fitness)",
-                        i + 1, cfg.max_iterations, medium_fitness * 100);
-                reportProgress(callback, LocalizationStage::MEDIUM_ICP,
-                              overall_prog, stage_prog, buf,
-                              total_hypotheses, static_cast<int>(hypotheses.size()),
-                              best_hyp_score, medium_fitness, i + 1, cfg.max_iterations);
-
-                if (result.converged) break;
-            }
-            std::cout << " fitness=" << (medium_fitness * 100) << "%" << std::endl;
+            // Update progress
+            float stage_prog = static_cast<float>(h + 1) / NUM_MEDIUM;
+            float overall_prog = 0.50f + stage_prog * 0.25f;
+            char buf[128];
+            snprintf(buf, sizeof(buf), "Medium ICP: %d/%d (best: %.1f%%)",
+                    h + 1, NUM_MEDIUM, candidate.final_fitness * 100);
+            reportProgress(callback, LocalizationStage::MEDIUM_ICP,
+                          overall_prog, stage_prog, buf,
+                          total_hypotheses, NUM_MEDIUM);
         }
 
-        // === Stage 4: Fine ICP (70-95%) ===
-        if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+        auto t_medium_end = std::chrono::high_resolution_clock::now();
+        double medium_time_ms = std::chrono::duration<double, std::milli>(t_medium_end - t_medium_start).count();
+        std::cout << "    Medium ICP took " << std::fixed << std::setprecision(0) << medium_time_ms << "ms" << std::endl;
 
-        std::cout << "  Fine ICP..." << std::flush;
+        // Sort by medium fitness
+        std::sort(refined_candidates.begin(), refined_candidates.begin() + NUM_MEDIUM,
+                  [](const auto& a, const auto& b) { return a.final_fitness > b.final_fitness; });
+
+        // === Stage 4: Fine ICP on ONLY the best candidate (75-90%) ===
+        std::cout << "\n  Running fine ICP on best candidate only..." << std::endl;
         reportProgress(callback, LocalizationStage::FINE_ICP,
-                      0.70f, 0.0f, "Starting fine alignment...",
-                      total_hypotheses, static_cast<int>(hypotheses.size()),
-                      best_hyp_score, medium_fitness);
-        double final_confidence;
+                      0.75f, 0.0f, "Fine alignment on best candidate...",
+                      total_hypotheses, 1);
+
+        auto t_fine_start = std::chrono::high_resolution_clock::now();
+        auto scan_fine = voxelDownsample(local_map, config_.fine_voxel);  // 0.1m voxels
+
+        // CRITICAL OPTIMIZATION: Crop tightly around best candidate for fine ICP
+        // At this point we know approximate position, so we can use a tight crop
+        std::vector<V3D> map_cropped_fine;
         {
-            auto scan_down = voxelDownsample(local_map, config_.fine_voxel);
-            auto map_down = voxelDownsample(prebuilt_map_points_, config_.fine_voxel);
+            double best_x = refined_candidates[0].pose(0, 3);
+            double best_y = refined_candidates[0].pose(1, 3);
+            double fine_margin = 20.0;  // Tight crop around best candidate
+
+            map_cropped_fine.reserve(map_cropped_medium.size());  // Usually similar size
+            for (const auto& pt : prebuilt_map_points_) {
+                if (pt.x() >= best_x - fine_margin && pt.x() <= best_x + fine_margin &&
+                    pt.y() >= best_y - fine_margin && pt.y() <= best_y + fine_margin) {
+                    map_cropped_fine.push_back(pt);
+                }
+            }
+            std::cout << "    Cropped for fine ICP: " << map_cropped_fine.size()
+                      << " points (around " << best_x << ", " << best_y << ")" << std::endl;
+        }
+        auto map_fine = voxelDownsample(map_cropped_fine, config_.fine_voxel);
+        std::cout << "    Downsampled: scan=" << scan_fine.size() << " map=" << map_fine.size() << " points" << std::endl;
+
+        {
+            auto& best = refined_candidates[0];
 
             ICPConfig cfg;
-            cfg.max_iterations = 50;
-            cfg.max_correspondence_dist = 0.5;
+            cfg.max_iterations = 30;
+            cfg.max_correspondence_dist = 0.4;
             cfg.convergence_threshold = 1e-6;
 
             ICP icp(cfg);
-            for (int i = 0; i < cfg.max_iterations; i++) {
-                if (cancel_requested_.load()) return {M4D::Identity(), 0.0};
+            auto result = icp.align(scan_fine, map_fine, best.pose);
+            best.pose = result.transformation;
+            best.final_fitness = result.fitness_score;
 
-                auto result = icp.alignOneIteration(scan_down, map_down, best_pose);
-                best_pose = result.transformation;
-                final_confidence = result.fitness_score;
-
-                float stage_prog = static_cast<float>(i + 1) / cfg.max_iterations;
-                float overall_prog = 0.70f + stage_prog * 0.25f;
-                char buf[128];
-                snprintf(buf, sizeof(buf), "Fine ICP: iteration %d/%d (%.1f%% fitness)",
-                        i + 1, cfg.max_iterations, final_confidence * 100);
-                reportProgress(callback, LocalizationStage::FINE_ICP,
-                              overall_prog, stage_prog, buf,
-                              total_hypotheses, static_cast<int>(hypotheses.size()),
-                              best_hyp_score, final_confidence, i + 1, cfg.max_iterations);
-
-                if (result.converged) break;
-            }
-            std::cout << " fitness=" << (final_confidence * 100) << "%" << std::endl;
+            double x = best.pose(0, 3);
+            double y = best.pose(1, 3);
+            double yaw = std::atan2(best.pose(1, 0), best.pose(0, 0)) * 180.0 / M_PI;
+            std::cout << "    Best final: pos=(" << std::fixed << std::setprecision(2)
+                      << x << "," << y << ") yaw=" << std::setprecision(1) << yaw
+                      << "deg fit=" << (best.final_fitness * 100) << "%" << std::endl;
         }
 
-        // === Stage 5: Evaluation (95-100%) ===
-        reportProgress(callback, LocalizationStage::EVALUATING,
-                      0.95f, 0.0f, "Evaluating result...",
-                      total_hypotheses, static_cast<int>(hypotheses.size()),
-                      best_hyp_score, final_confidence);
+        auto t_fine_end = std::chrono::high_resolution_clock::now();
+        double fine_time_ms = std::chrono::duration<double, std::milli>(t_fine_end - t_fine_start).count();
+        std::cout << "    Fine ICP took " << std::fixed << std::setprecision(0) << fine_time_ms << "ms" << std::endl;
 
+        reportProgress(callback, LocalizationStage::FINE_ICP,
+                      0.90f, 1.0f, "Fine alignment complete",
+                      total_hypotheses, 1);
+
+        // === Stage 5: Distinctiveness check (90-95%) ===
+        // Use medium fitness for distinctiveness (we only ran fine on the best)
+        reportProgress(callback, LocalizationStage::EVALUATING,
+                      0.90f, 0.0f, "Evaluating distinctiveness...",
+                      total_hypotheses, NUM_MEDIUM);
+
+        double best_fitness = refined_candidates[0].final_fitness;
+        double second_fitness = NUM_MEDIUM > 1 ? refined_candidates[1].final_fitness : 0.0;
+        double distinctiveness = (best_fitness - second_fitness) / std::max(0.01, best_fitness);
+
+        std::cout << "\n=== DISTINCTIVENESS CHECK ===" << std::endl;
+        std::cout << "  Best fitness (fine):   " << std::fixed << std::setprecision(1) << (best_fitness * 100) << "%" << std::endl;
+        std::cout << "  Second fitness (med):  " << (second_fitness * 100) << "%" << std::endl;
+        std::cout << "  Distinctiveness: " << (distinctiveness * 100) << "%" << std::endl;
+
+        // Position comparison between top 2
+        if (NUM_MEDIUM > 1) {
+            double dx = refined_candidates[0].pose(0, 3) - refined_candidates[1].pose(0, 3);
+            double dy = refined_candidates[0].pose(1, 3) - refined_candidates[1].pose(1, 3);
+            double dist = std::sqrt(dx * dx + dy * dy);
+            double yaw1 = std::atan2(refined_candidates[0].pose(1, 0), refined_candidates[0].pose(0, 0)) * 180.0 / M_PI;
+            double yaw2 = std::atan2(refined_candidates[1].pose(1, 0), refined_candidates[1].pose(0, 0)) * 180.0 / M_PI;
+            std::cout << "  Distance between top 2: " << std::setprecision(2) << dist << "m" << std::endl;
+            std::cout << "  Yaw difference: " << std::setprecision(1) << std::abs(yaw1 - yaw2) << "deg" << std::endl;
+        }
+
+        // Determine result quality
+        std::string quality;
+        if (best_fitness >= 0.60 && distinctiveness >= 0.15) {
+            quality = "HIGH CONFIDENCE";
+        } else if (best_fitness >= 0.50 && distinctiveness >= 0.10) {
+            quality = "MEDIUM CONFIDENCE";
+        } else if (distinctiveness < 0.10) {
+            quality = "AMBIGUOUS (low distinctiveness)";
+        } else {
+            quality = "LOW CONFIDENCE";
+        }
+        std::cout << "  Result: " << quality << std::endl;
+        std::cout << "========================\n" << std::endl;
+
+        M4D best_pose = refined_candidates[0].pose;
+        double final_confidence = best_fitness;
+
+        // === Stage 5: Complete ===
         char buf[128];
-        snprintf(buf, sizeof(buf), "Complete: %.1f%% confidence", final_confidence * 100);
+        snprintf(buf, sizeof(buf), "Complete: %.1f%% (distinct: %.0f%%)",
+                 final_confidence * 100, distinctiveness * 100);
         reportProgress(callback, LocalizationStage::COMPLETE,
                       1.0f, 1.0f, buf,
-                      total_hypotheses, static_cast<int>(hypotheses.size()),
-                      best_hyp_score, final_confidence);
+                      total_hypotheses, static_cast<int>(hypotheses.size()));
 
         return {best_pose, final_confidence};
     }
@@ -974,6 +1862,7 @@ private:
     ProgressiveLocalizerConfig config_;
     CoverageMonitor coverage_monitor_;
     VoxelOccupancyMap prebuilt_voxels_;
+    ScanContextDatabase sc_database_;      // Keyframe database for place recognition
     std::vector<V3D> prebuilt_map_points_;
     V3D prebuilt_min_, prebuilt_max_;
 

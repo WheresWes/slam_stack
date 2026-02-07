@@ -578,6 +578,8 @@ public:
     void setTarget(const V3F& target) { target_ = target; }
     void setDistance(float dist) { distance_ = dist; }
     void setRotation(float yaw, float pitch) { yaw_ = yaw; pitch_ = pitch; }
+    float getDistance() const { return distance_; }
+    V3F getTarget() const { return target_; }
 
     void rotate(float dyaw, float dpitch);
     void pan(float dx, float dy);
@@ -657,6 +659,7 @@ public:
 
     // Robot pose visualization
     void setRobotPose(float x, float y, float heading);
+    void centerCameraOnRobot();
 
     // Click-to-pose
     void setMapClickCallback(SlamViewer::MapClickCallback callback);

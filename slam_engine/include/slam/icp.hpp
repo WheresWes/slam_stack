@@ -57,6 +57,11 @@ struct ICPConfig {
     int normal_estimation_k = 10;          // K neighbors for normal estimation
     double normal_estimation_radius = 0.5; // Radius for normal estimation
     int num_threads = 4;
+
+    // GRAVITY CONSTRAINT: When true, constrains rotation to yaw-only (roll=pitch=0)
+    // This is critical for ground robots with IMU - reduces 6DOF to 4DOF
+    // Faster convergence, physically valid poses, better accuracy
+    bool constrain_gravity = true;
 };
 
 struct ICPResult {
@@ -787,6 +792,24 @@ private:
         if (R.determinant() < 0) {
             V.col(2) *= -1;
             R = V * U.transpose();
+        }
+
+        // GRAVITY CONSTRAINT: If enabled, extract yaw and reconstruct with roll=pitch=0
+        // This reduces 6DOF to 4DOF (x, y, z, yaw), which is physically correct for
+        // ground robots with IMU gravity alignment
+        if (config_.constrain_gravity) {
+            // Extract yaw from the full rotation matrix
+            // R = Rz(yaw) * Ry(pitch) * Rx(roll)
+            // For small roll/pitch, yaw ≈ atan2(R(1,0), R(0,0))
+            double yaw = std::atan2(R(1, 0), R(0, 0));
+
+            // Reconstruct yaw-only rotation (roll=0, pitch=0)
+            R = Eigen::Matrix3d::Identity();
+            R(0, 0) = std::cos(yaw);
+            R(0, 1) = -std::sin(yaw);
+            R(1, 0) = std::sin(yaw);
+            R(1, 1) = std::cos(yaw);
+            // R(2, 2) = 1 (identity for Z axis)
         }
 
         // Compute translation

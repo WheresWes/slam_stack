@@ -21,6 +21,7 @@
 #include <atomic>
 #include <functional>
 #include <condition_variable>
+#include <iomanip>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -330,10 +331,13 @@ public:
     /**
      * @brief Set initial pose estimate (for localization mode)
      * @param pose 4x4 transformation matrix (world to body)
+     * @param preserve_biases If true, keep existing IMU biases (use after localization).
+     *                        If false, reset biases to zero (use for fresh start).
      *
      * Use this when starting localization with a rough initial guess.
+     * IMPORTANT: Set preserve_biases=true when IMU has been running to prevent flyaway!
      */
-    void setInitialPose(const M4D& pose);
+    void setInitialPose(const M4D& pose, bool preserve_biases = false);
 
     /**
      * @brief Update voxel size for map filtering
@@ -680,11 +684,18 @@ private:
     M4D T_map_to_odom_ = M4D::Identity();
     bool transform_initialized_ = false;
     double last_global_localization_time_ = 0.0;
+    V3D last_tracking_position_ = V3D::Zero();  // For distance-based tracking trigger
 
-    // Localization parameters
-    static constexpr double LOCALIZATION_PERIOD_S = 1.0;      // Run global localization every 1s
-    static constexpr double LOCALIZATION_FITNESS_MIN = 0.90;  // 90% fitness required (like original)
-    static constexpr double POSE_JUMP_THRESHOLD = 1.0;        // Reject corrections > 1m jump
+    // Cached downsampled prebuilt map (computed once, reused for tracking ICP)
+    std::vector<V3D> prebuilt_map_cached_;
+    bool prebuilt_map_cache_valid_ = false;
+
+    // Tracking localization parameters (optimized for continuous use)
+    static constexpr double TRACKING_PERIOD_S = 3.0;          // Run tracking ICP every 3s (was 1s)
+    static constexpr double TRACKING_DISTANCE_M = 2.0;        // Or every 2m of travel
+    static constexpr double TRACKING_FITNESS_MIN = 0.80;      // 80% fitness for tracking (stricter)
+    static constexpr double TRACKING_JUMP_THRESHOLD = 0.3;    // Reject corrections > 30cm
+    static constexpr double TRACKING_HEADING_THRESHOLD = 5.0; // Reject heading change > 5deg
 };
 
 //=============================================================================
@@ -990,11 +1001,14 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
             return;
         }
         if (feats_down_size_ > 5) {
-            // Reset EKF position to origin for first map
-            state_ikfom reset_state = kf_.get_x();
-            reset_state.pos = V3D(0, 0, 0);
-            reset_state.vel = V3D(0, 0, 0);
-            kf_.change_x(reset_state);
+            // Only reset EKF position to origin if NOT coming from localization
+            // After localization, ekf_initialized_ is already true and we have a valid pose
+            if (!ekf_initialized_) {
+                state_ikfom reset_state = kf_.get_x();
+                reset_state.pos = V3D(0, 0, 0);
+                reset_state.vel = V3D(0, 0, 0);
+                kf_.change_x(reset_state);
+            }
             state_point_ = kf_.get_x();
 
             feats_down_world_->resize(feats_down_size_);
@@ -1015,14 +1029,19 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
 
             ikdtree_.Build(feats_down_world_->points);
 
-            // Initialize local map bounds at origin
-            for (int i = 0; i < 3; i++) {
-                local_map_points_.vertex_min[i] = -config_.cube_len / 2.0;
-                local_map_points_.vertex_max[i] = config_.cube_len / 2.0;
-            }
+            // Initialize local map bounds centered on current position
+            // (not origin - important for localization where we start at discovered pose)
+            V3D pos = state_point_.pos;
+            local_map_points_.vertex_min[0] = pos.x() - config_.cube_len / 2.0;
+            local_map_points_.vertex_max[0] = pos.x() + config_.cube_len / 2.0;
+            local_map_points_.vertex_min[1] = pos.y() - config_.cube_len / 2.0;
+            local_map_points_.vertex_max[1] = pos.y() + config_.cube_len / 2.0;
+            local_map_points_.vertex_min[2] = pos.z() - config_.cube_len / 2.0;
+            local_map_points_.vertex_max[2] = pos.z() + config_.cube_len / 2.0;
             localmap_initialized_ = true;
 
-            std::cout << "[SlamEngine] Map initialized with " << feats_down_size_ << " points" << std::endl;
+            std::cout << "[SlamEngine] Map initialized with " << feats_down_size_ << " points"
+                      << " at pos (" << pos.x() << ", " << pos.y() << ", " << pos.z() << ")" << std::endl;
         }
         return;
     }
@@ -1147,12 +1166,20 @@ inline void SlamEngine::processMeasurement(MeasureGroup& meas) {
     auto map_end = std::chrono::high_resolution_clock::now();
     debug_timing_.map_update_us = std::chrono::duration<double, std::micro>(map_end - map_start).count();
 
-    // In localization mode, periodically attempt global localization to update T_map_to_odom
-    if (localization_mode_ && prebuilt_map_loaded_) {
+    // In localization mode, periodically attempt tracking ICP to update T_map_to_odom
+    // Trigger: every TRACKING_PERIOD_S seconds OR every TRACKING_DISTANCE_M meters
+    if (localization_mode_ && prebuilt_map_loaded_ && transform_initialized_) {
         double current_time = meas.lidar_end_time;
-        if (current_time - last_global_localization_time_ >= LOCALIZATION_PERIOD_S) {
+        V3D current_pos = state_point_.pos;
+        double distance = (current_pos - last_tracking_position_).norm();
+
+        bool time_trigger = (current_time - last_global_localization_time_ >= TRACKING_PERIOD_S);
+        bool distance_trigger = (distance >= TRACKING_DISTANCE_M);
+
+        if (time_trigger || distance_trigger) {
             attemptGlobalLocalizationUpdate();
             last_global_localization_time_ = current_time;
+            last_tracking_position_ = current_pos;
         }
     }
 
@@ -1784,21 +1811,34 @@ inline void SlamEngine::setLocalizationMode(bool enabled) {
     }
 }
 
-inline void SlamEngine::setInitialPose(const M4D& pose) {
-    std::cout << "[SlamEngine] Setting initial pose" << std::endl;
+inline void SlamEngine::setInitialPose(const M4D& pose, bool preserve_biases) {
+    std::cout << "[SlamEngine] Setting initial pose (preserve_biases="
+              << (preserve_biases ? "true" : "false") << ")" << std::endl;
 
     // Extract rotation and translation from 4x4 matrix
     M3D R = pose.block<3, 3>(0, 0);
     V3D t = pose.block<3, 1>(0, 3);
 
-    // Update EKF state
+    // Get current state to preserve biases if needed
+    state_point_ = kf_.get_x();
+
+    // Update position and rotation
     state_point_.rot = MTK::SO3<double>(Eigen::Quaterniond(R));
     state_point_.pos = t;
 
-    // Reset velocities and biases to zero
+    // Reset velocity (position changed, so velocity is meaningless)
     state_point_.vel = V3D::Zero();
-    state_point_.bg = V3D::Zero();
-    state_point_.ba = V3D::Zero();
+
+    // CRITICAL: Only reset biases for truly fresh starts
+    // Preserving biases after localization prevents flyaway!
+    if (!preserve_biases) {
+        std::cout << "  Resetting IMU biases to zero" << std::endl;
+        state_point_.bg = V3D::Zero();
+        state_point_.ba = V3D::Zero();
+    } else {
+        std::cout << "  Preserving IMU biases: bg=[" << state_point_.bg.transpose()
+                  << "] ba=[" << state_point_.ba.transpose() << "]" << std::endl;
+    }
 
     // Update the EKF
     kf_.change_x(state_point_);
@@ -1954,7 +1994,8 @@ inline bool SlamEngine::globalRelocalize(const M4D& initial_guess) {
 
     if (final_result.fitness_score > 0.3) {
         // Update pose with ICP result
-        setInitialPose(final_result.transformation);
+        // PRESERVE BIASES - IMU has been running, biases are valid
+        setInitialPose(final_result.transformation, true);
         std::cout << "[SlamEngine] Re-localization SUCCESSFUL" << std::endl;
         return true;
     } else {
@@ -1998,6 +2039,10 @@ inline bool SlamEngine::loadPrebuiltMap(const std::string& filename) {
     // Store the pre-built map (don't load into ikd-tree yet)
     prebuilt_map_points_ = map_cloud->points;
     prebuilt_map_loaded_ = true;
+
+    // Invalidate tracking ICP cache (will be rebuilt on first tracking call)
+    prebuilt_map_cache_valid_ = false;
+    prebuilt_map_cached_.clear();
 
     std::cout << "[SlamEngine] Pre-built map loaded: " << prebuilt_map_points_.size()
               << " points (stored in memory)" << std::endl;
@@ -2043,29 +2088,42 @@ inline void SlamEngine::swapToPrebuiltMap(const M4D& transform) {
         return;
     }
 
-    std::cout << "[SlamEngine] Initializing transform fusion localization..." << std::endl;
+    std::cout << "[SlamEngine] Initializing localization with odom-to-map transform..." << std::endl;
 
-    // NEW APPROACH: Transform Fusion (like original FAST-LIO-Localization)
-    // - Do NOT replace ikd-tree (keep building local map)
-    // - Store the discovered transform T_map_to_odom
-    // - Output pose = T_map_to_odom * local_slam_pose
+    // TRANSFORM FUSION APPROACH (like original FAST-LIO-Localization)
+    // - DON'T reset SLAM or change EKF state (IMU biases stay valid!)
+    // - T_map_to_odom_ IS the odom→map point transform (maps odom coords to map coords)
+    // - getPose() returns T_map_to_odom_ × local_pose = global robot pose
+    // This is stable because SLAM continues in its local frame undisturbed.
 
-    // Initialize the map-to-odom transform
+    // The 'transform' parameter is the odom→map point transform from ICP
+    // (re-centering adjusted). It directly maps local SLAM coordinates to map coordinates.
     T_map_to_odom_ = transform;
+
+    // Enable localization mode
+    localization_mode_ = true;
     transform_initialized_ = true;
 
-    // Enable localization mode (activates periodic global localization updates)
-    setLocalizationMode(true);
+    // Log the transform and resulting global pose
+    M4D local_pose = getLocalPose();
+    M4D global_pose = T_map_to_odom_ * local_pose;
+    V3D global_pos = global_pose.block<3, 1>(0, 3);
+    M3D global_rot = global_pose.block<3, 3>(0, 0);
+    double global_yaw = std::atan2(global_rot(1, 0), global_rot(0, 0));
 
-    // Reset the localization timer
-    last_global_localization_time_ = lidar_end_time_;
+    V3D local_pos = local_pose.block<3, 1>(0, 3);
+    double local_yaw = std::atan2(local_pose(1, 0), local_pose(0, 0));
 
-    std::cout << "[SlamEngine] Transform fusion initialized successfully" << std::endl;
-    std::cout << "  T_map_to_odom translation: ["
-              << transform(0, 3) << ", " << transform(1, 3) << ", " << transform(2, 3) << "]" << std::endl;
-    std::cout << "  Local ikd-tree size: " << ikdtree_.validnum() << " points (continuing to build)" << std::endl;
-    std::cout << "  Pre-built map size: " << prebuilt_map_points_.size() << " points" << std::endl;
-    std::cout << "  Localization mode: ENABLED (periodic ICP correction)" << std::endl;
+    std::cout << "  Global robot pose: [" << global_pos.x() << ", "
+              << global_pos.y() << ", " << global_pos.z() << "] yaw="
+              << (global_yaw * 180.0 / M_PI) << "deg" << std::endl;
+    std::cout << "  Local SLAM pose: [" << local_pos.x() << ", "
+              << local_pos.y() << ", " << local_pos.z() << "] yaw="
+              << (local_yaw * 180.0 / M_PI) << "deg" << std::endl;
+    std::cout << "[SlamEngine] Transform fusion enabled" << std::endl;
+    std::cout << "  SLAM continues in local frame (IMU biases preserved)" << std::endl;
+    std::cout << "  getPose() now returns global coordinates via T_map_to_odom" << std::endl;
+    std::cout << "  Pre-built map: " << prebuilt_map_points_.size() << " points (reference only)" << std::endl;
 }
 
 inline LocalizationResult SlamEngine::checkProgressiveLocalization() {
@@ -2205,117 +2263,85 @@ inline void SlamEngine::attemptGlobalLocalizationUpdate() {
         return;
     }
 
-    // Get current local SLAM state
-    M4D local_pose = getLocalPose();
-    V3D local_pos = local_pose.block<3, 1>(0, 3);
+    // Build cached prebuilt map on first call (0.2m voxels for tracking)
+    if (!prebuilt_map_cache_valid_) {
+        std::vector<V3D> prebuilt_full;
+        prebuilt_full.reserve(prebuilt_map_points_.size());
+        for (const auto& pt : prebuilt_map_points_) {
+            prebuilt_full.emplace_back(pt.x, pt.y, pt.z);
+        }
+        prebuilt_map_cached_ = voxelDownsample(prebuilt_full, 0.2);
+        prebuilt_map_cache_valid_ = true;
+        std::cout << "[Tracking] Cached " << prebuilt_map_cached_.size()
+                  << " prebuilt map points (0.2m voxels)" << std::endl;
+    }
 
-    // Get current local map points (not the pre-built map)
+    // Get current local map points
     auto local_map = getMapPoints();
     if (local_map.size() < 1000) {
-        // Not enough local map coverage yet
         return;
     }
 
-    // Convert local map to V3D for ICP
+    // Downsample local map (0.2m voxels to match cached prebuilt)
     std::vector<V3D> local_points;
     local_points.reserve(local_map.size());
     for (const auto& pt : local_map) {
         local_points.emplace_back(pt.x, pt.y, pt.z);
     }
+    auto local_down = voxelDownsample(local_points, 0.2);
 
-    // Convert pre-built map to V3D for ICP
-    std::vector<V3D> prebuilt_points;
-    prebuilt_points.reserve(prebuilt_map_points_.size());
-    for (const auto& pt : prebuilt_map_points_) {
-        prebuilt_points.emplace_back(pt.x, pt.y, pt.z);
-    }
+    // Use previous transform as initial guess
+    M4D initial_guess = T_map_to_odom_;
 
-    // Current guess: if we have a previous transform, use it
-    M4D initial_guess = M4D::Identity();
-    if (transform_initialized_) {
-        // Use current best estimate
-        initial_guess = T_map_to_odom_;
-    }
+    // Single-stage ICP (since we're already close during tracking)
+    ICPConfig cfg;
+    cfg.max_iterations = 20;
+    cfg.max_correspondence_dist = 0.5;  // Tight - we're already close
+    cfg.convergence_threshold = 1e-5;
 
-    // Multi-scale ICP: local map → pre-built map
-    // This finds T such that: prebuilt = T * local
-    // So T = T_map_to_odom (transform from local/odom frame to map frame)
+    ICP icp(cfg);
+    auto result = icp.align(local_down, prebuilt_map_cached_, initial_guess);
 
-    ICPResult final_result;
-
-    // Stage 1: Coarse (0.5m voxels)
-    {
-        auto local_down = voxelDownsample(local_points, 0.5);
-        auto prebuilt_down = voxelDownsample(prebuilt_points, 0.5);
-
-        ICPConfig cfg;
-        cfg.max_iterations = 15;
-        cfg.max_correspondence_dist = 3.0;
-        cfg.convergence_threshold = 1e-4;
-
-        ICP icp(cfg);
-        auto result = icp.align(local_down, prebuilt_down, initial_guess);
-        initial_guess = result.transformation;
-    }
-
-    // Stage 2: Medium (0.2m voxels)
-    {
-        auto local_down = voxelDownsample(local_points, 0.2);
-        auto prebuilt_down = voxelDownsample(prebuilt_points, 0.2);
-
-        ICPConfig cfg;
-        cfg.max_iterations = 20;
-        cfg.max_correspondence_dist = 1.0;
-        cfg.convergence_threshold = 1e-5;
-
-        ICP icp(cfg);
-        auto result = icp.align(local_down, prebuilt_down, initial_guess);
-        initial_guess = result.transformation;
-    }
-
-    // Stage 3: Fine (0.1m voxels)
-    {
-        auto local_down = voxelDownsample(local_points, 0.1);
-        auto prebuilt_down = voxelDownsample(prebuilt_points, 0.1);
-
-        ICPConfig cfg;
-        cfg.max_iterations = 30;
-        cfg.max_correspondence_dist = 0.5;
-        cfg.convergence_threshold = 1e-6;
-
-        ICP icp(cfg);
-        final_result = icp.align(local_down, prebuilt_down, initial_guess);
-    }
-
-    // Check fitness threshold (like original FAST-LIO-Localization: 95%)
-    if (final_result.fitness_score < LOCALIZATION_FITNESS_MIN) {
-        // Fitness too low - don't update transform
-        std::cout << "[Localization] Rejected update: fitness=" << final_result.fitness_score
-                  << " (need >=" << LOCALIZATION_FITNESS_MIN << ")" << std::endl;
+    // Check fitness threshold (stricter for tracking)
+    if (result.fitness_score < TRACKING_FITNESS_MIN) {
+        std::cout << "[Tracking] Rejected: fitness=" << std::fixed << std::setprecision(1)
+                  << (result.fitness_score * 100) << "% (need >=" << (TRACKING_FITNESS_MIN * 100)
+                  << "%)" << std::endl;
         return;
     }
 
-    // Check for pose jump (sanity check)
-    if (transform_initialized_) {
-        V3D old_pos = T_map_to_odom_.block<3, 1>(0, 3);
-        V3D new_pos = final_result.transformation.block<3, 1>(0, 3);
-        double pos_jump = (new_pos - old_pos).norm();
+    // Check position jump
+    V3D old_pos = T_map_to_odom_.block<3, 1>(0, 3);
+    V3D new_pos = result.transformation.block<3, 1>(0, 3);
+    double pos_jump = (new_pos - old_pos).norm();
 
-        if (pos_jump > POSE_JUMP_THRESHOLD) {
-            // Jump too large - something went wrong
-            std::cout << "[Localization] Rejected update: position jump=" << pos_jump
-                      << "m (max=" << POSE_JUMP_THRESHOLD << "m)" << std::endl;
-            return;
-        }
+    if (pos_jump > TRACKING_JUMP_THRESHOLD) {
+        std::cout << "[Tracking] Rejected: position jump=" << std::fixed << std::setprecision(2)
+                  << pos_jump << "m (max=" << TRACKING_JUMP_THRESHOLD << "m)" << std::endl;
+        return;
+    }
+
+    // Check heading jump
+    double old_yaw = std::atan2(T_map_to_odom_(1, 0), T_map_to_odom_(0, 0));
+    double new_yaw = std::atan2(result.transformation(1, 0), result.transformation(0, 0));
+    double heading_jump_deg = std::abs(new_yaw - old_yaw) * 180.0 / M_PI;
+    // Handle wraparound
+    if (heading_jump_deg > 180.0) heading_jump_deg = 360.0 - heading_jump_deg;
+
+    if (heading_jump_deg > TRACKING_HEADING_THRESHOLD) {
+        std::cout << "[Tracking] Rejected: heading jump=" << std::fixed << std::setprecision(1)
+                  << heading_jump_deg << "deg (max=" << TRACKING_HEADING_THRESHOLD << "deg)" << std::endl;
+        return;
     }
 
     // Accept the update
-    T_map_to_odom_ = final_result.transformation;
-    transform_initialized_ = true;
-    localization_fitness_ = final_result.fitness_score;
+    T_map_to_odom_ = result.transformation;
+    localization_fitness_ = result.fitness_score;
 
-    std::cout << "[Localization] Transform updated: fitness=" << final_result.fitness_score
-              << " rmse=" << final_result.rmse << "m" << std::endl;
+    // Verbose logging for debugging
+    std::cout << "[Tracking] Updated: fit=" << std::fixed << std::setprecision(1)
+              << (result.fitness_score * 100) << "% pos_delta=" << std::setprecision(2) << pos_jump
+              << "m hdg_delta=" << std::setprecision(1) << heading_jump_deg << "deg" << std::endl;
 }
 
 } // namespace slam

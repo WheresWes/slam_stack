@@ -998,6 +998,324 @@ Recording captures: IMU @ 200Hz, Point clouds @ 10Hz, VESC status @ 50Hz, Wheel 
    - Measure absolute position error vs ground truth
    - Should combine benefits of both sensors
 
+## Localization System Overhaul (January 2026)
+
+### Implementation Status: COMPLETE ✓
+
+| Component | Status | File(s) |
+|-----------|--------|---------|
+| MapOverviewWidget | ✓ Complete | `slam_gui.cpp` (lines 251-567) |
+| LocalizationHint struct | ✓ Complete | `slam_gui.cpp`, `command_queue.hpp` |
+| Bounded search | ✓ Complete | `progressive_localizer.hpp` (lines 762-843) |
+| Multi-hypothesis ICP (top 20) | ✓ Complete | `progressive_localizer.hpp` (lines 901-1021) |
+| Distinctiveness check | ✓ Complete | `progressive_localizer.hpp` (lines 1032-1064) |
+| Detailed logging | ✓ Complete | `progressive_localizer.hpp` |
+| Tracking ICP optimization | ✓ Complete | `slam_engine.hpp` (lines 2218-2302) |
+
+**Build verified:** January 2026
+
+### Problem Statement
+
+The current progressive localization system is **unreliable** due to:
+
+1. **Brute-force grid search** - O(X×Y×θ) = 7500+ hypotheses for a 50m×50m map
+2. **Single-hypothesis refinement** - Only the top voxel-scored candidate is refined with ICP
+3. **No distinctiveness check** - Can't detect ambiguous matches in repetitive environments
+4. **Impractical UI** - No visual way to provide position hint
+5. **Heavy tracking ICP** - Full 3-stage ICP every 1 second
+
+### Solution Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    RELIABLE LOCALIZATION SYSTEM                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  TIER 1: INITIAL LOCALIZATION (one-time, ~10 seconds)                       │
+│  ─────────────────────────────────────────────────────                      │
+│                                                                             │
+│  Step 1: USER PROVIDES HINT (required)                                      │
+│    • Click on 2D map overview to set approximate position                   │
+│    • Drag to indicate heading direction (optional)                          │
+│    • Adjust search radius slider (default 10m)                              │
+│                                                                             │
+│  Step 2: CANDIDATE GENERATION (bounded, fast)                               │
+│    • Search ONLY within hint circle (not entire map)                        │
+│    • Grid: 1m step × 1m step × 15° yaw step                                 │
+│    • Example: 20m radius → ~400 candidates (not 7500!)                      │
+│    • Score via voxel occupancy (0.3m voxels)                                │
+│    • Keep top 20 candidates                                                 │
+│                                                                             │
+│  Step 3: MULTI-HYPOTHESIS ICP (thorough)                                    │
+│    • Run 2-stage ICP on EACH of top 20 candidates                           │
+│    • Record fitness score for each                                          │
+│    • Sort by fitness, keep top 5                                            │
+│                                                                             │
+│  Step 4: VERIFICATION (strict)                                              │
+│    • fitness = best ICP result                                              │
+│    • distinctiveness = (best - 2nd_best) / best                             │
+│    • ACCEPT if: fitness ≥ 0.60 AND distinctiveness ≥ 0.15                   │
+│    • WARN if: fitness ≥ 0.50 AND distinctiveness ≥ 0.10                     │
+│    • FAIL otherwise                                                         │
+│                                                                             │
+│  TIER 2: TRACKING (continuous, lightweight)                                 │
+│  ──────────────────────────────────────────                                 │
+│                                                                             │
+│  • Output: T_map_to_odom × local_slam_pose                                  │
+│  • Every 3 seconds: single-stage ICP to refine T_map_to_odom                │
+│  • Conservative acceptance: fitness ≥ 0.80, jump < 0.3m, heading < 5°       │
+│  • On failure: keep old transform (trust SLAM odometry)                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Implementation Plan
+
+#### Phase 1: Map Overview Widget (GUI)
+
+**Files:** `slam_gui.cpp`
+
+**New Data Structures:**
+```cpp
+struct LocalizationHint {
+    bool valid = false;
+    double x = 0.0, y = 0.0;           // Position in map frame
+    bool heading_known = false;
+    double heading_rad = 0.0;          // 0 = +X axis
+    double heading_range_rad = M_PI/3; // ±60° if known
+    double search_radius_m = 10.0;     // Default 10m
+};
+
+struct MapOverviewState {
+    double pan_x = 0.0, pan_y = 0.0;
+    double zoom = 1.0;
+    std::vector<Point2D> map_points_2d;  // Cached top-down projection
+    double map_min_x, map_max_x, map_min_y, map_max_y;
+    bool is_dragging = false;
+};
+```
+
+**Widget Features:**
+- Top-down view of prebuilt map (X-Y projection, colored by Z)
+- Click to set position → green marker
+- Drag to set heading → yellow arrow
+- Scroll to zoom, middle-drag to pan
+- Adjustable search radius slider
+- Scale bar for reference
+
+**Verification:**
+- [ ] Map renders correctly for test PLY file
+- [ ] Click/drag sets hint position/heading
+- [ ] Zoom/pan works smoothly
+- [ ] Search radius circle updates in real-time
+
+#### Phase 2: Bounded Search in ProgressiveLocalizer
+
+**Files:** `progressive_localizer.hpp`
+
+**Config Changes:**
+```cpp
+struct ProgressiveLocalizerConfig {
+    // Existing fields...
+
+    // NEW: Hint-based search
+    bool use_hint = false;
+    V3D hint_position = V3D::Zero();
+    double hint_radius = 10.0;
+    double hint_heading = 0.0;
+    bool hint_heading_known = false;
+    double hint_heading_range = M_PI;
+
+    // Finer grid for bounded search
+    double grid_step = 1.0;       // Was 2.0
+    double yaw_step_deg = 15.0;   // Was 30.0
+};
+```
+
+**Algorithm Changes:**
+- `generateCandidates()` uses hint bounds instead of full map bounds
+- Circular clipping: skip candidates outside hint_radius from hint_position
+- Heading clipping: skip candidates outside heading range (if known)
+
+**Verification:**
+- [ ] With 10m hint radius: ~400 candidates (not 7500)
+- [ ] Candidates correctly bounded to circular region
+- [ ] Heading range correctly applied when specified
+
+#### Phase 3: Multi-Hypothesis ICP Refinement
+
+**Files:** `progressive_localizer.hpp`
+
+**Changes to `attemptGlobalLocalizationWithProgress()`:**
+
+```cpp
+// BEFORE: Only refine best hypothesis
+M4D best_pose = hypotheses[0].first;
+result = icp.align(local_map, prebuilt_map, best_pose);
+
+// AFTER: Refine top N hypotheses
+std::vector<RefinedCandidate> refined;
+int num_to_refine = std::min(20, (int)hypotheses.size());
+
+for (int i = 0; i < num_to_refine; i++) {
+    M4D pose = hypotheses[i].first;
+    auto result = runTwoStageICP(local_map, prebuilt_map, pose);
+    refined.push_back({pose, result.fitness, result.rmse});
+}
+
+// Sort by fitness
+std::sort(refined.begin(), refined.end(),
+          [](auto& a, auto& b) { return a.fitness > b.fitness; });
+```
+
+**Verification:**
+- [ ] All top 20 candidates get ICP refinement
+- [ ] Results sorted correctly by fitness
+- [ ] Progress callback reports refinement progress
+
+#### Phase 4: Distinctiveness Verification
+
+**Files:** `progressive_localizer.hpp`
+
+**New Verification Logic:**
+```cpp
+double best_fitness = refined[0].fitness;
+double second_fitness = refined.size() > 1 ? refined[1].fitness : 0.0;
+double distinctiveness = (best_fitness - second_fitness) /
+                         std::max(0.01, best_fitness);
+
+// Acceptance criteria
+if (best_fitness >= 0.60 && distinctiveness >= 0.15) {
+    status = LocalizationStatus::SUCCESS;
+} else if (best_fitness >= 0.50 && distinctiveness >= 0.10) {
+    status = LocalizationStatus::SUCCESS_LOW_CONFIDENCE;
+} else if (distinctiveness < 0.10) {
+    status = LocalizationStatus::AMBIGUOUS;
+} else {
+    status = LocalizationStatus::FAILED;
+}
+```
+
+**Verification:**
+- [ ] Ambiguous cases correctly detected (low distinctiveness)
+- [ ] High-confidence cases pass quickly
+- [ ] Low-confidence cases flagged with warning
+
+#### Phase 5: Optimized Tracking ICP
+
+**Files:** `slam_engine.hpp`
+
+**Changes to `attemptGlobalLocalizationUpdate()`:**
+
+```cpp
+// Cache downsampled prebuilt map (only compute once)
+static std::vector<V3D> prebuilt_map_cached;
+static bool cache_valid = false;
+if (!cache_valid) {
+    prebuilt_map_cached = voxelDownsample(prebuilt_map_points_, 0.2);
+    cache_valid = true;
+}
+
+// Single-stage ICP (not 3-stage)
+ICPConfig cfg;
+cfg.max_iterations = 20;
+cfg.max_correspondence_dist = 0.5;  // Tight since we're close
+cfg.convergence_threshold = 1e-5;
+
+auto result = icp.align(local_map_down, prebuilt_map_cached, T_map_to_odom_);
+
+// Conservative acceptance
+V3D pos_change = result.transformation.block<3,1>(0,3) -
+                 T_map_to_odom_.block<3,1>(0,3);
+double heading_change = /* compute from rotation matrices */;
+
+if (result.fitness >= 0.80 &&
+    pos_change.norm() < 0.3 &&      // Less than 30cm
+    heading_change < 5.0 * M_PI/180) {  // Less than 5°
+    T_map_to_odom_ = result.transformation;
+} else {
+    // Keep old transform, log warning
+}
+```
+
+**Also change frequency:**
+- From: every 1 second
+- To: every 3 seconds OR after 2m travel
+
+**Verification:**
+- [ ] Tracking ICP runs faster (single stage)
+- [ ] Jump rejection working (large changes rejected)
+- [ ] Frequency reduced to 3 seconds
+
+### Post-Implementation Review Plan
+
+#### Functional Testing
+
+| Test Case | Expected Result | Pass Criteria |
+|-----------|-----------------|---------------|
+| **Hint Selection** |
+| Click on map | Green marker appears at click location | Position within 1m of click |
+| Drag from click | Yellow heading arrow appears | Heading within 15° of drag |
+| Adjust radius slider | Circle size updates | Visual matches slider value |
+| **Initial Localization** |
+| Robot at hint ±5m | SUCCESS | Fitness ≥ 0.60, distinct ≥ 0.15 |
+| Robot at hint ±15m (outside radius) | FAILED or low confidence | Does not return wrong position |
+| Repetitive environment (hull ribs) | AMBIGUOUS or WARNING | Distinctiveness < 0.15 detected |
+| **Tracking** |
+| Stationary robot | Transform stable | No updates (SLAM alone) |
+| Slow motion | Transform updated smoothly | Jump < 0.3m per update |
+| Fast motion | Transform may skip updates | Keeps old transform (safe) |
+| Partial occlusion | Warning logged | Doesn't diverge |
+
+#### Performance Testing
+
+| Metric | Before | Target | Measured |
+|--------|--------|--------|----------|
+| Candidates generated (50m map) | 7500+ | <500 | |
+| Initial localization time | >60s | <15s | |
+| Tracking ICP frequency | 1 Hz | 0.3 Hz | |
+| Memory (map caching) | Alloc per call | Once | |
+
+#### Reliability Testing
+
+1. **False Positive Rate**: Run 20 localizations at WRONG hint positions
+   - Expected: 0 false successes (all should fail)
+   - Measure: Count of SUCCESS at wrong location
+
+2. **True Positive Rate**: Run 20 localizations at CORRECT hint positions
+   - Expected: >90% success rate
+   - Measure: Count of SUCCESS at correct location
+
+3. **Ambiguity Detection**: Run 10 localizations in repetitive areas
+   - Expected: AMBIGUOUS or WARNING status
+   - Measure: Count of correctly detected ambiguous cases
+
+#### Code Review Checklist
+
+- [ ] All new code has comments explaining purpose
+- [ ] No memory leaks (check cached maps, vectors)
+- [ ] Thread safety (if any shared state)
+- [ ] Error handling (null checks, bounds checks)
+- [ ] Progress callbacks fire correctly
+- [ ] Status messages are clear and helpful
+- [ ] No hardcoded paths or magic numbers
+
+#### Documentation
+
+- [ ] CLAUDE.md updated with new architecture
+- [ ] Code comments explain algorithm choices
+- [ ] User-facing messages are clear
+- [ ] Known limitations documented
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `slam_gui.cpp` | +300 lines: MapOverviewWidget, hint selection UI |
+| `progressive_localizer.hpp` | ~100 lines modified: bounded search, multi-hyp ICP, distinctiveness |
+| `slam_engine.hpp` | ~50 lines modified: cached tracking ICP, reduced frequency |
+| `CLAUDE.md` | This documentation |
+
 ## TODO / Future Work
 
 - [x] ~~Debug map point corruption issue~~ (RESOLVED - was analysis script bug)

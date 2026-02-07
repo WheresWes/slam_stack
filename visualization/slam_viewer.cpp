@@ -215,6 +215,10 @@ void SlamViewer::setRobotPose(float x, float y, float heading) {
     impl_->setRobotPose(x, y, heading);
 }
 
+void SlamViewer::centerCameraOnRobot() {
+    impl_->centerCameraOnRobot();
+}
+
 void SlamViewer::setMapClickCallback(MapClickCallback callback) {
     impl_->setMapClickCallback(std::move(callback));
 }
@@ -1908,11 +1912,15 @@ void SlamViewerImpl::renderWidget(float width, float height) {
             }
         } else {
             // Normal camera control mode
+            // Match CPU viewer controls: Right=pan, Middle=rotate (or Left=rotate)
             if (io.MouseDown[0]) {  // Left button - rotate
                 // Negate X so drag-left = rotate-left (conventional behavior)
                 camera_.rotate(-io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
             }
-            if (io.MouseDown[2]) {  // Middle button - pan
+            if (io.MouseDown[1]) {  // Right button - pan (matches CPU viewer)
+                camera_.pan(-io.MouseDelta.x, io.MouseDelta.y);
+            }
+            if (io.MouseDown[2]) {  // Middle button - pan (also pan for consistency)
                 camera_.pan(-io.MouseDelta.x, io.MouseDelta.y);
             }
         }
@@ -1987,18 +1995,36 @@ void SlamViewerImpl::renderCoverage() {
 void SlamViewerImpl::setRobotPose(float x, float y, float heading) {
     robotX_ = x;
     robotY_ = y;
-    robotZ_ = 0.0f;  // Robot is on the ground plane (Z=up)
+    // Use the minimum Z of the map bounds as the floor level
+    // This ensures the robot marker is visible at the same level as the map
+    robotZ_ = boundsMin_.z();
     robotHeading_ = heading;
     showRobot_ = true;
+}
+
+void SlamViewerImpl::centerCameraOnRobot() {
+    if (!showRobot_) return;
+    // Center camera on robot position at a reasonable distance
+    V3F robotPos(robotX_, robotY_, robotZ_);
+    camera_.setTarget(robotPos);
+    // Set distance based on map size, but don't zoom too far in
+    float mapDiagonal = (boundsMax_ - boundsMin_).norm();
+    float viewDist = std::max(5.0f, mapDiagonal * 0.3f);
+    camera_.setDistance(viewDist);
 }
 
 void SlamViewerImpl::renderRobotMarker() {
     if (!showRobot_) return;
 
     // Create robot triangle marker - pointing in heading direction
-    // Robot size: ~0.3m length, ~0.2m width (reasonable for a small robot)
-    const float length = 0.3f;
-    const float width = 0.2f;
+    // Scale robot size based on camera distance to keep it visible at all zoom levels
+    // Base size is 1.0m which scales with zoom
+    float camDist = camera_.getDistance();
+    float scale = std::max(0.5f, camDist * 0.03f);  // 3% of camera distance, min 0.5m
+
+    const float length = scale;
+    const float width = scale * 0.7f;
+    const float height = scale * 0.5f;  // Give it some height for visibility
 
     // Calculate triangle vertices in world space
     // Heading is in radians, 0 = +X direction, positive = counter-clockwise
@@ -2009,13 +2035,15 @@ void SlamViewerImpl::renderRobotMarker() {
     //   Front tip (in direction of heading)
     //   Back-left corner
     //   Back-right corner
-    V3F tip(robotX_ + length * cosH, robotY_ + length * sinH, robotZ_ + 0.05f);
+    // Elevate above the ground for visibility
+    float zBase = robotZ_ + height;
+    V3F tip(robotX_ + length * cosH, robotY_ + length * sinH, zBase);
     V3F backLeft(robotX_ - length * 0.3f * cosH + width * 0.5f * sinH,
                  robotY_ - length * 0.3f * sinH - width * 0.5f * cosH,
-                 robotZ_ + 0.05f);
+                 zBase);
     V3F backRight(robotX_ - length * 0.3f * cosH - width * 0.5f * sinH,
                   robotY_ - length * 0.3f * sinH + width * 0.5f * cosH,
-                  robotZ_ + 0.05f);
+                  zBase);
 
     V3F robotVerts[3] = { tip, backLeft, backRight };
 
